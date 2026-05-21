@@ -44,12 +44,16 @@ def retrieve_node(state:GraphState):
 
     cypher_query = """
     // 1. Vector Search
-    CALL db.index.vector.queryNodes('faq_embeddings', 10, $question_embedding) YIELD node AS vector_node, score AS vector_score
-    WITH collect(vector_node) AS vector_nodes
+    CALL () {
+        CALL db.index.vector.queryNodes('faq_embeddings', 10, $question_embedding) YIELD node AS vector_node
+        RETURN collect(vector_node) AS vector_nodes
+    }
     
     // 2. Keyword Search
-    CALL db.index.fulltext.queryNodes('faq_text_index', $keyword_query, {limit: 10}) YIELD node AS text_node, score AS text_score
-    WITH vector_nodes, collect(text_node) AS text_nodes
+    CALL () {
+        CALL db.index.fulltext.queryNodes('faq_text_index', $keyword_query, {limit: 10}) YIELD node AS text_node
+        RETURN collect(text_node) AS text_nodes
+    }
     
     // 3. Combine, Remove Duplicates, and Traverse Graph
     UNWIND (vector_nodes + text_nodes) AS f
