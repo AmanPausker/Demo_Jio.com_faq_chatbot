@@ -16,7 +16,7 @@ def generate_and_save_embeddings():
 
     with driver.session() as session:
         print("Fetching all FAQ's from Neo4j...") 
-        fetch_query = """MATCH (f:FAQ) RETURN id(f) AS node_id, f.question AS question, f.answer AS answer"""
+        fetch_query = """MATCH (f:FAQ) WHERE f.embedding IS NULL RETURN id(f) AS node_id, f.question AS question, f.answer AS answer"""
         result = session.run(fetch_query)
         
         records = list(result)
