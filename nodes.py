@@ -34,14 +34,17 @@ def retrieve_node(state:GraphState):
     try:
         kw_response = client.invoke([HumanMessage(content=kw_prompt)])
         keywords = kw_response.content.strip().split()
-        # Create an AND logic query for Lucene, e.g., "keyword1 AND keyword2"
-        keyword_query = " AND ".join(keywords) if keywords else question
+        # Create an AND logic query for Lucene with fuzzy matching (e.g. "keyword1~ AND keyword2~")
+        # The '~' operator enables fuzzy matching for typos (like "siggy" instead of "swiggy")
+        keyword_query = " AND ".join([f"{kw}~" for kw in keywords]) if keywords else question
     except Exception as e:
         print(f"Keyword extraction failed: {e}")
         keyword_query = question
         
     print(f"Executing keyword query: {keyword_query}")
+# $question_embedding -> is the embedding of the question query.
 
+# Included fuzzy searching (also works on siggy instead of swiggy) -learned in college (even if some params are missing stil the vectors can find out the missing params.)
     cypher_query = """
     // 1. Vector Search
     CALL () {
