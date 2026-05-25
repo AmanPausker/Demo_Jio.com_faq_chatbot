@@ -3,7 +3,7 @@
 An intelligent, context-aware FAQ Chatbot built for Jio.com's support queries. It utilizes a **Graph Database (Neo4j)** for structuring data and a robust **Hybrid Search (Vector + Enhanced BM25)** pipeline powered by **LangGraph** and **Llama 3.1 8B**.
 
 ## 🚀 Features & Architecture
-  ```mermaid
+```mermaid
 graph TD
 
 A[User Query] --> B[GraphState]
@@ -26,7 +26,7 @@ J --> K[Candidate Contexts]
 
 K --> L[CrossEncoder Reranking]
 
-L --> M[Top 3 FAQs]
+L --> M[Top 3 Retrieved FAQs]
 
 M --> N[generate_node()]
 
