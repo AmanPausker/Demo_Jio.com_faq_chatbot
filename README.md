@@ -3,7 +3,37 @@
 An intelligent, context-aware FAQ Chatbot built for Jio.com's support queries. It utilizes a **Graph Database (Neo4j)** for structuring data and a robust **Hybrid Search (Vector + Enhanced BM25)** pipeline powered by **LangGraph** and **Llama 3.1 8B**.
 
 ## 🚀 Features & Architecture
+```mermaid
+graph TD
 
+A["User Query"] --> B["GraphState"]
+
+B --> C["retrieve_node()"]
+
+C --> D["Embedding Generation"]
+C --> E["Keyword Extraction"]
+C --> F["User Question"]
+
+D --> G["Neo4j Vector Search"]
+E --> H["Lucene Fulltext Search"]
+
+G --> I["Hybrid Retrieval"]
+H --> I
+
+I --> J["Graph Traversal"]
+
+J --> K["Candidate Contexts"]
+
+K --> L["CrossEncoder Reranking"]
+
+L --> M["Top 3 Retrieved FAQs"]
+
+M --> N["generate_node()"]
+
+N --> O["Cerebras LLM Generation"]
+
+O --> P["Final Response"]
+```
 ### 1. Data Pipeline
 - **Extraction**: Scraped API links of each main topic and sub-topic from the official Jio.com FAQ section.
 - **Processing**: Extracted Q&A data from each link and compiled everything into a structured `jio_faq_data.json` file.
