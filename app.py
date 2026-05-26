@@ -18,14 +18,20 @@ app = workflow.compile()
 
 from get_transcript import listen_for_speech
 
+from get_audio import generate_speech
+
 async def process_text(user_message, history):
     if not user_message:
-        return "", history
+        return "", history, None
     initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
     final_state = await app.ainvoke(initial_state)
+    answer = final_state['answer']
     history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": final_state['answer']})
-    return "", history
+    history.append({"role": "assistant", "content": answer})
+    
+    # Generate TTS
+    audio_path = await generate_speech(answer)
+    return "", history, audio_path
 
 async def process_audio(history):
     # This triggers the server-side microphone
@@ -33,18 +39,23 @@ async def process_audio(history):
     
     if not user_message.strip():
         history.append({"role": "assistant", "content": "🎤 [Audio Mode] No speech detected. Please try speaking again."})
-        return history
+        return history, None
         
     initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
     final_state = await app.ainvoke(initial_state)
+    answer = final_state['answer']
     history.append({"role": "user", "content": f"(User-Audio) {user_message}"})
-    history.append({"role": "assistant", "content": final_state['answer']})
-    return history
+    history.append({"role": "assistant", "content": answer})
+    
+    # Generate TTS
+    audio_path = await generate_speech(answer)
+    return history, audio_path
 
 with gr.Blocks(title="JIO FAQ BOT") as demo:
     gr.Markdown("# JIO FAQ BOT\nAsk me anything about Jio Plans, 5G, or services")
     
     chatbot = gr.Chatbot()
+    audio_out = gr.Audio(visible=True, autoplay=True, label="Bot Voice Response")
     
     with gr.Row():
         with gr.Column(scale=8):
@@ -54,9 +65,9 @@ with gr.Blocks(title="JIO FAQ BOT") as demo:
         with gr.Column(scale=1):
             audio_btn = gr.Button("🎤")
 
-    msg.submit(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot])
-    text_btn.click(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot])
-    audio_btn.click(process_audio, inputs=[chatbot], outputs=[chatbot])
+    msg.submit(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot, audio_out])
+    text_btn.click(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot, audio_out])
+    audio_btn.click(process_audio, inputs=[chatbot], outputs=[chatbot, audio_out])
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
