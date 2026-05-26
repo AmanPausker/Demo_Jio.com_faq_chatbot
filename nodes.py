@@ -29,16 +29,12 @@ def retrieve_node(state:GraphState):
     question = state['question']
     question_vector = model.encode(question).tolist() #converts numpy array to python list.
 
-    # 0. Extract Keywords using LLM for Full-Text Search
-    kw_prompt = f"Extract 2 to 4 of the most important keywords from this question. Return ONLY the keywords separated by spaces, no other text. Question: {question}"
-    try:
-        kw_response = client.invoke([HumanMessage(content=kw_prompt)])
-        keywords = kw_response.content.strip().split()
-        # Create an AND logic query for Lucene, e.g., "keyword1 AND keyword2"
-        keyword_query = " AND ".join(keywords) if keywords else question
-    except Exception as e:
-        print(f"Keyword extraction failed: {e}")
-        keyword_query = question
+    # 0. Extract Keywords locally (Instant)
+    import re
+    words = re.findall(r'\b\w+\b', question)
+    stopwords = {"is", "what", "how", "the", "a", "an", "for", "to", "in", "on", "of", "and", "or", "tell", "me", "about", "are", "do", "does", "i", "can"}
+    keywords = [w for w in words if w.lower() not in stopwords]
+    keyword_query = " OR ".join(keywords) if keywords else question
         
     print(f"Executing keyword query: {keyword_query}")
 
@@ -92,11 +88,11 @@ def generate_node(state:GraphState):
     Use the following CONTEXT to answer the user's question. 
     
     IMPORTANT INSTRUCTIONS:
-    1. Your answers must be EXACT and highly specific, directly addressing the user's query.
-    2. Do NOT generalize, combine, or summarize multiple FAQs into a single response.
-    3. If the user's query is a broad topic, identify the single most relevant FAQ from the context and provide its exact answer.
-    4. If the context doesn't contain the answer, say you couldn't find information about that in the Jio FAQs.
-    5. Do not create new information or guess.
+    1. Answer the user's query clearly and concisely using ONLY the provided context.
+    2. If the user's query is broad (e.g., "Tell me about X"), find the most relevant FAQ in the context and provide its details.
+    3. Treat slight variations in spelling or spacing (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same thing.
+    4. If the context does not contain the answer at all, say you couldn't find information about that in the Jio FAQs.
+    5. Do not create new information or guess outside the context.
     
     CONTEXT:
     {context}"""
