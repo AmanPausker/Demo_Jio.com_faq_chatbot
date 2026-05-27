@@ -41,7 +41,7 @@ async def process_text(user_message, history):
 
 async def process_audio(history):
     # This triggers the server-side microphone
-    user_message = await listen_for_speech(silence_timeout=2.0)
+    user_message = await listen_for_speech(silence_timeout=0.5)
     
     if not user_message.strip():
         history.append({"role": "assistant", "content": "🎤 [Audio Mode] No speech detected. Please try speaking again."})
