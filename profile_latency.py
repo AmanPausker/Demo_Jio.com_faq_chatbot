@@ -23,7 +23,8 @@ async def run_profiling():
     
     # 3. Generate Speech
     t4 = time.time()
-    await generate_speech(state['answer'], "profile_output.mp3")
+    async for _ in generate_speech(state['answer']):
+        pass
     t5 = time.time()
     print(f"[3] generate_speech (Sarvam TTS) took: {t5 - t4:.2f} seconds")
     

@@ -47,11 +47,15 @@ async def listen_for_speech(silence_timeout: float = 2.0) -> str:
                 
                 # Check if it's a data response containing a transcript
                 if getattr(response, "type", None) == "data" and response.data.transcript:
-                    state["latest_transcript"] = response.data.transcript
-                    state["last_update_time"] = asyncio.get_event_loop().time()
+                    new_transcript = response.data.transcript.strip()
                     
-                    # Overwrite the same line in the console for a clean UX
-                    print(f"\rTranscript: {state['latest_transcript']}", end="", flush=True)
+                    # Only reset the silence timer if the transcript actually grew or changed
+                    if new_transcript != state["latest_transcript"].strip():
+                        state["latest_transcript"] = new_transcript
+                        state["last_update_time"] = asyncio.get_event_loop().time()
+                        
+                        # Overwrite the same line in the console for a clean UX
+                        print(f"\rTranscript: {state['latest_transcript']}", end="", flush=True)
             except Exception:
                 # Connection closed
                 break
