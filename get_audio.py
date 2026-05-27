@@ -9,7 +9,7 @@ API_KEY = os.getenv("SARVAM_API_KEY")
 
 import uuid
 
-async def generate_speech(input_text: str):
+async def generate_speech(input_text: str, **kwargs):
     """
     Connects to Sarvam's TTS API, converts the input_text into speech,
     and returns the audio data as a single tuple (sample_rate, numpy_data) 
@@ -68,7 +68,19 @@ async def generate_speech(input_text: str):
                 audio_data_list.append(np.frombuffer(frames, dtype=np.int16))
                 
         if audio_data_list:
-            return (framerate, np.concatenate(audio_data_list))
+            concatenated_audio = np.concatenate(audio_data_list)
+            if kwargs.get("return_base64", False):
+                import io
+                import wave
+                out_io = io.BytesIO()
+                with wave.open(out_io, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2) # 16-bit
+                    wav_file.setframerate(framerate)
+                    wav_file.writeframes(concatenated_audio.tobytes())
+                b64_audio = base64.b64encode(out_io.getvalue()).decode('utf-8')
+                return b64_audio
+            return (framerate, concatenated_audio)
         
     except Exception as e:
         print(f"Error generating speech: {e}")

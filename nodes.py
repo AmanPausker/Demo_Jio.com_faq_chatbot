@@ -57,25 +57,28 @@ def retrieve_node(state:GraphState):
     
     question = re.sub(r'\b[A-Za-z]+\b', fuzzy_replace, question)
     
-    # 0.1 Generalized Brand Normalizer
-    # Find any phrase like "Jio Plus", "Jio Fiber", "Jio Cinema"
-    import re
-    jio_compounds = re.findall(r'(?i)\bjio\s+\w+\b', question)
-    glued_compounds = [comp.replace(" ", "") for comp in jio_compounds]
+    # 0.1 Specific Brand Normalizer
+    # Only glue specific brands that are written as single words in the FAQ
+    brand_map = {
+        r"(?i)\bjio\s*plus\b": "JioPlus",
+        r"(?i)\bjio\s*cinema\b": "JioCinema",
+        r"(?i)\bjio\s*saavn\b": "JioSaavn",
+        r"(?i)\bjio\s*tv\b": "JioTV",
+        r"(?i)\bjio\s*mart\b": "JioMart",
+        r"(?i)\bmy\s*jio\b": "MyJio"
+    }
     
-    # Expand the question to include BOTH spaced and unspaced versions
-    expanded_question = question + " " + " ".join(glued_compounds)
+    keyword_question = question
+    for pattern, replacement in brand_map.items():
+        keyword_question = re.sub(pattern, replacement, keyword_question)
     
-    # 1. Vector Search uses the expanded question
-    question_vector = model.encode(expanded_question).tolist()
+    # 1. Vector Search uses the normalized question
+    question_vector = model.encode(keyword_question).tolist()
 
     # 2. Extract Keywords locally
-    words = re.findall(r'\b\w+\b', question)
+    words = re.findall(r'\b\w+\b', keyword_question)
     stopwords = {"is", "what", "how", "the", "a", "an", "for", "to", "in", "on", "of", "and", "or", "tell", "me", "about", "are", "do", "does", "i", "can", "something", "some"}
     keywords = [w for w in words if w.lower() not in stopwords]
-    
-    # Add our glued compounds to the keyword search as well
-    keywords.extend(glued_compounds)
         
     keyword_query = " OR ".join(keywords) if keywords else question
         
@@ -111,8 +114,8 @@ def retrieve_node(state:GraphState):
         return {"context": ""}
 
     # 4. Rerank candidates using CrossEncoder
-    # Create question-candidate pairs using the expanded question
-    cross_inp = [[expanded_question, context] for context in candidates]
+    # Create question-candidate pairs using the normalized question
+    cross_inp = [[keyword_question, context] for context in candidates]
     scores = reranker.predict(cross_inp)
 
     # Combine candidates with scores and sort by score descending
@@ -124,9 +127,9 @@ def retrieve_node(state:GraphState):
     print("----------------------------\n")
 
     # Select the top 3 best matching candidates
-    top_3_candidates = [candidate for candidate, score in scored_candidates[:3]]
+    top_candidates = [candidate for candidate, score in scored_candidates[:3]]
     
-    retrieved_context = "\n".join(top_3_candidates) + "\n"
+    retrieved_context = "\n".join(top_candidates) + "\n"
     return {"context": retrieved_context}
 
 def generate_node(state:GraphState):
