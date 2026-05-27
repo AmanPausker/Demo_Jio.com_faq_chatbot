@@ -27,13 +27,56 @@ reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 def retrieve_node(state:GraphState):
     print("Retreiving from neo4j")
     question = state['question']
-    question_vector = model.encode(question).tolist() #converts numpy array to python list.
-
-    # 0. Extract Keywords locally (Instant)
+    
+    # 0. Ultimate Fuzzy Logic Normalizer (Phonetic + String Similarity)
+    # Automatically corrects mistranscriptions and typos.
+    import jellyfish
+    import difflib
     import re
+    
+    JIO_DICTIONARY = ["Jio", "Fiber", "AirFiber", "Postpaid", "Prepaid", "Cinema", "Saavn", "Mart", "Plus", "Hotstar", "Netflix", "Amazon", "Swiggy", "Zomato", "MyJio"]
+    phonetic_lookup = {jellyfish.metaphone(word): word for word in JIO_DICTIONARY}
+    
+    def fuzzy_replace(match):
+        word = match.group(0)
+        if len(word) <= 2 and word.lower() not in ["4g", "5g"]:
+            return word
+            
+        # 1. Phonetic Check (Catches "Geo" -> "Jio")
+        code = jellyfish.metaphone(word)
+        if code in phonetic_lookup:
+            return phonetic_lookup[code]
+            
+        # 2. String Similarity Check (Catches "siggy" -> "Swiggy", "fibre" -> "Fiber")
+        # We check against the dictionary ignoring case, but difflib is case-sensitive, so we use titlecase
+        close_matches = difflib.get_close_matches(word.title(), JIO_DICTIONARY, n=1, cutoff=0.7)
+        if close_matches:
+            return close_matches[0]
+            
+        return word
+    
+    question = re.sub(r'\b[A-Za-z]+\b', fuzzy_replace, question)
+    
+    # 0.1 Generalized Brand Normalizer
+    # Find any phrase like "Jio Plus", "Jio Fiber", "Jio Cinema"
+    import re
+    jio_compounds = re.findall(r'(?i)\bjio\s+\w+\b', question)
+    glued_compounds = [comp.replace(" ", "") for comp in jio_compounds]
+    
+    # Expand the question to include BOTH spaced and unspaced versions
+    expanded_question = question + " " + " ".join(glued_compounds)
+    
+    # 1. Vector Search uses the expanded question
+    question_vector = model.encode(expanded_question).tolist()
+
+    # 2. Extract Keywords locally
     words = re.findall(r'\b\w+\b', question)
-    stopwords = {"is", "what", "how", "the", "a", "an", "for", "to", "in", "on", "of", "and", "or", "tell", "me", "about", "are", "do", "does", "i", "can"}
+    stopwords = {"is", "what", "how", "the", "a", "an", "for", "to", "in", "on", "of", "and", "or", "tell", "me", "about", "are", "do", "does", "i", "can", "something", "some"}
     keywords = [w for w in words if w.lower() not in stopwords]
+    
+    # Add our glued compounds to the keyword search as well
+    keywords.extend(glued_compounds)
+        
     keyword_query = " OR ".join(keywords) if keywords else question
         
     print(f"Executing keyword query: {keyword_query}")
@@ -68,12 +111,17 @@ def retrieve_node(state:GraphState):
         return {"context": ""}
 
     # 4. Rerank candidates using CrossEncoder
-    # Create question-candidate pairs
-    cross_inp = [[question, context] for context in candidates]
+    # Create question-candidate pairs using the expanded question
+    cross_inp = [[expanded_question, context] for context in candidates]
     scores = reranker.predict(cross_inp)
 
     # Combine candidates with scores and sort by score descending
     scored_candidates = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    
+    print("\n--- Cross Encoder Scores ---")
+    for doc, score in scored_candidates:
+        print(f"Score {score:.4f} | {doc[:80]}...")
+    print("----------------------------\n")
 
     # Select the top 3 best matching candidates
     top_3_candidates = [candidate for candidate, score in scored_candidates[:3]]
@@ -88,7 +136,7 @@ def generate_node(state:GraphState):
     Use the following CONTEXT to answer the user's question. 
     
     IMPORTANT INSTRUCTIONS:
-    1. Answer the user's query clearly and concisely using ONLY the provided context.
+    1. Answer the user's query clearly and in detail using ONLY the provided context.
     2. If the user's query is broad (e.g., "Tell me about X"), find the most relevant FAQ in the context and provide its details.
     3. Treat slight variations in spelling or spacing (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same thing.
     4. If the context does not contain the answer at all, say you couldn't find information about that in the Jio FAQs.

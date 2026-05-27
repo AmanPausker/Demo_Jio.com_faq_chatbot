@@ -22,16 +22,19 @@ from get_audio import generate_speech
 
 async def process_text(user_message, history):
     if not user_message:
-        return "", history, None
+        yield "", history, None
+        return
     initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
     final_state = await app.ainvoke(initial_state)
     answer = final_state['answer']
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": answer})
     
+    yield "", history, None
+    
     # Generate TTS
-    audio_path = await generate_speech(answer)
-    return "", history, audio_path
+    async for audio_chunk in generate_speech(answer):
+        yield "", history, audio_chunk
 
 async def process_audio(history):
     # This triggers the server-side microphone
@@ -39,7 +42,8 @@ async def process_audio(history):
     
     if not user_message.strip():
         history.append({"role": "assistant", "content": "🎤 [Audio Mode] No speech detected. Please try speaking again."})
-        return history, None
+        yield history, None
+        return
         
     initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
     final_state = await app.ainvoke(initial_state)
@@ -47,15 +51,17 @@ async def process_audio(history):
     history.append({"role": "user", "content": f"(User-Audio) {user_message}"})
     history.append({"role": "assistant", "content": answer})
     
+    yield history, None
+    
     # Generate TTS
-    audio_path = await generate_speech(answer)
-    return history, audio_path
+    async for audio_chunk in generate_speech(answer):
+        yield history, audio_chunk
 
 with gr.Blocks(title="JIO FAQ BOT") as demo:
     gr.Markdown("# JIO FAQ BOT\nAsk me anything about Jio Plans, 5G, or services")
     
     chatbot = gr.Chatbot()
-    audio_out = gr.Audio(visible=True, autoplay=True, label="Bot Voice Response")
+    audio_out = gr.Audio(visible=True, autoplay=True, label="Bot Voice Response", streaming=True)
     
     with gr.Row():
         with gr.Column(scale=8):
