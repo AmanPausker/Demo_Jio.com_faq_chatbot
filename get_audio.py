@@ -25,8 +25,22 @@ async def generate_speech(input_text: str):
         import re
         import asyncio
         
-        # Split text into chunks (sentences)
-        chunks = [c.strip() for c in re.split(r'(?<=[.!?\n])\s+', input_text) if c.strip()]
+        # Split text into sentences
+        sentences = [c.strip() for c in re.split(r'(?<=[.!?\n])\s+', input_text) if c.strip()]
+        
+        # Group sentences to avoid sending too many concurrent API requests
+        chunks = []
+        current_chunk = ""
+        for s in sentences:
+            if len(current_chunk) + len(s) < 200:
+                current_chunk += s + " "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = s + " "
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
         if not chunks:
             chunks = [input_text]
             
