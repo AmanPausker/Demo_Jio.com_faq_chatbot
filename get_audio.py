@@ -12,8 +12,8 @@ import uuid
 async def generate_speech(input_text: str):
     """
     Connects to Sarvam's TTS API, converts the input_text into speech,
-    and yields the audio data chunks as tuples (sample_rate, numpy_data) 
-    for direct streaming playback in Gradio.
+    and returns the audio data as a single tuple (sample_rate, numpy_data) 
+    for direct playback in Gradio.
     """
     client = AsyncSarvamAI(api_subscription_key=API_KEY)
 
@@ -41,15 +41,22 @@ async def generate_speech(input_text: str):
             
         # Launch all tasks in parallel
         tasks = [asyncio.create_task(get_chunk(c, i)) for i, c in enumerate(chunks)]
+        results = await asyncio.gather(*tasks)
+        results.sort(key=lambda x: x[0])
         
-        # Yield results sequentially
-        for task in tasks:
-            index, audio_bytes = await task
+        audio_data_list = []
+        framerate = None
+        for i, (_, audio_bytes) in enumerate(results):
             with wave.open(io.BytesIO(audio_bytes), "rb") as input_wav:
-                framerate = input_wav.getframerate()
+                if i == 0:
+                    framerate = input_wav.getframerate()
                 frames = input_wav.readframes(input_wav.getnframes())
-                data = np.frombuffer(frames, dtype=np.int16)
-            yield (framerate, data)
+                audio_data_list.append(np.frombuffer(frames, dtype=np.int16))
+                
+        if audio_data_list:
+            return (framerate, np.concatenate(audio_data_list))
         
     except Exception as e:
-        print(f"Error generating speech stream: {e}")
+        print(f"Error generating speech: {e}")
+
+    return None
