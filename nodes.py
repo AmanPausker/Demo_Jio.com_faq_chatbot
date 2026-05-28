@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 CEREBRAS_API_KEY=os.getenv("CEREBRAS_API_KEY")
-client = ChatCerebras(model ="llama3.1-8b",api_key=CEREBRAS_API_KEY)
+client = ChatCerebras(model="gpt-oss-120b", api_key=CEREBRAS_API_KEY)
 
 
 URL = "bolt://localhost:7687"
