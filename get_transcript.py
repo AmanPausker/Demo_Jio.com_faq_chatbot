@@ -17,7 +17,6 @@ CHANNELS = 1
 BLOCKSIZE = 1600   # 100 ms chunks at 16kHz
 VAD_WINDOW = 512   # 32 ms — Silero VAD expects exactly 512 samples at 16kHz
 
-print("Loading Silero VAD model...")
 _vad_model = load_silero_vad()
 print("Silero VAD model loaded.")
 

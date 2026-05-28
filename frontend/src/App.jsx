@@ -60,72 +60,72 @@ function App() {
 
     unlockAudio();
 
-    const userMsg = { id: Date.now(), role: 'user', text: inputText };
-    setMessages(prev => [...prev, userMsg]);
-    setInputText('');
-    setIsLoading(true);
+      const userMsg = { id: crypto.randomUUID(), role: 'user', text: inputText };
+      setMessages(prev => [...prev, userMsg]);
+      setInputText('');
+      setIsLoading(true);
 
-    try {
-      const response = await fetch('http://localhost:8000/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg.text })
-      });
+      try {
+        const response = await fetch('http://localhost:8000/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userMsg.text })
+        });
 
-      const data = await response.json();
-      setMessages(prev => [...prev, { id: Date.now(), role: 'bot', text: data.text }]);
-      playAudio(data.audio_base64);
-    } catch (error) {
-      console.error('Error:', error);
-      setMessages(prev => [...prev, { id: Date.now(), role: 'bot', text: 'Sorry, I encountered an error.' }]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+        const data = await response.json();
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.text }]);
+        playAudio(data.audio_base64);
+      } catch (error) {
+        console.error('Error:', error);
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error.' }]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
 
-  const sendAudioMessage = async (audioBlob) => {
-    setIsLoading(true);
+    const sendAudioMessage = async (audioBlob) => {
+      setIsLoading(true);
 
-    // Add a temporary placeholder so the user knows they stopped talking and it's processing
-    const tempId = Date.now();
-    setMessages(prev => [...prev, { id: tempId, role: 'user', text: `🎤 [Transcribing...]` }]);
+      // Add a temporary placeholder so the user knows they stopped talking and it's processing
+      const tempId = crypto.randomUUID();
+      setMessages(prev => [...prev, { id: tempId, role: 'user', text: `🎤 [Transcribing...]` }]);
 
-    const formData = new FormData();
-    formData.append('audio', audioBlob, 'recording.wav');
+      const formData = new FormData();
+      formData.append('audio', audioBlob, 'recording.wav');
 
-    try {
-      const response = await fetch('http://localhost:8000/api/chat/audio', {
-        method: 'POST',
-        body: formData
-      });
+      try {
+        const response = await fetch('http://localhost:8000/api/chat/audio', {
+          method: 'POST',
+          body: formData
+        });
 
-      const data = await response.json();
+        const data = await response.json();
 
-      setMessages(prev => {
-        // Remove the temporary message
-        const filtered = prev.filter(m => m.id !== tempId);
+        setMessages(prev => {
+          // Remove the temporary message
+          const filtered = prev.filter(m => m.id !== tempId);
 
-        // Add the real transcribed user message and the bot's response
-        const newMessages = [...filtered];
-        if (data.user_message) {
-          newMessages.push({ id: Date.now() - 1, role: 'user', text: `🎤 ${data.user_message}` });
-        }
-        newMessages.push({ id: Date.now(), role: 'bot', text: data.text });
-        return newMessages;
-      });
+          // Add the real transcribed user message and the bot's response
+          const newMessages = [...filtered];
+          if (data.user_message) {
+            newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `🎤 ${data.user_message}` });
+          }
+          newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text });
+          return newMessages;
+        });
 
-      playAudio(data.audio_base64);
+        playAudio(data.audio_base64);
 
-    } catch (error) {
-      console.error('Error:', error);
-      setMessages(prev => {
-        const filtered = prev.filter(m => m.id !== tempId);
-        return [...filtered, { id: Date.now(), role: 'bot', text: 'Sorry, I encountered an error processing your audio.' }];
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
+      } catch (error) {
+        console.error('Error:', error);
+        setMessages(prev => {
+          const filtered = prev.filter(m => m.id !== tempId);
+          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error processing your audio.' }];
+        });
+      } finally {
+        setIsLoading(false);
+      }
+    };
 
   // Manual Push-to-Talk for Text Mode
   const startRecording = async () => {
