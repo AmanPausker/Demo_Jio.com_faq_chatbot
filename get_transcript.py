@@ -1,55 +1,66 @@
 import asyncio
 import sounddevice as sd
-import numpy as np
-import base64
+import numpy as np # 1. Audio array manipulation, 2. converting float audio ->int16 PCM, 3. processing VAD samples
+import base64 # sarvam websocket expects audio encoded as Base64 String
 from sarvamai import SarvamAI
 import os
 from dotenv import load_dotenv
 from silero_vad import load_silero_vad, VADIterator
-import torch
+import torch # silero model runs on pyTorch tensors.
 
 load_dotenv(override=True)
 api_key = os.getenv("SARVAM_API_KEY")
 client = SarvamAI(api_subscription_key=api_key)
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
+SAMPLE_RATE = 16000 #16000 samples per second.
+CHANNELS = 1 # mono audio - 1 microphone channel
 BLOCKSIZE = 1600   # 100 ms chunks at 16kHz
 VAD_WINDOW = 512   # 32 ms — Silero VAD expects exactly 512 samples at 16kHz
-
+# therefore audio chunks are further divided into 32ms windows for VAD.
 _vad_model = load_silero_vad()
 print("Silero VAD model loaded.")
 
-
-async def listen_for_speech(silence_timeout: float = 0.5) -> str:
+#Allows multiple tasks to run concurrently
+async def listen_for_speech(silence_timeout: float = 0.5) -> str: # returns final transcript string.
     """
     Capture microphone audio with real-time Silero VAD silence detection.
     Returns the transcribed text once the user stops speaking.
     """
-    audio_queue = asyncio.Queue()
-    vad_event_queue = asyncio.Queue()
+    #Queues
+    audio_queue = asyncio.Queue() # Stores microphone audio chunks.
+    vad_event_queue = asyncio.Queue() #Stores speech events. start/end
     loop = asyncio.get_running_loop()
 
+    #This function is automatically called by sounddevice every 100ms
     def callback(indata, frames, time, status):
-        audio_data = (indata * 32767).astype(np.int16)
+        audio_data = (indata * 32767).astype(np.int16) #Converts float audio -> int16 PCM
+        #push audio into queue
         loop.call_soon_threadsafe(
             audio_queue.put_nowait,
             audio_data.tobytes()
         )
-
+    #Shared state dictionary.
     state = {
-        "latest_transcript": "",
-        "is_done": False,
+        "latest_transcript": "", #Stores most recent transcript
+        "is_done": False, # Controls stopping condition
     }
 
-    async def sender(stt_ws):
+    """
+    1. Reads audio from queue
+    2. Sends audio to Sarvam
+    3. Runs VAD on audio
+    """
+    async def sender(stt_ws): #stt_ws = sarvam websocked connection object.
         vad_buffer = []
+        # This continously tracks - speech start, speech end
         vad_iterator = VADIterator(
             _vad_model,
             threshold=0.5,
             sampling_rate=SAMPLE_RATE,
             min_silence_duration_ms=int(silence_timeout * 1000),
         )
+
+        #Wait for Audio chunk -  gets microphone audio from queue
         while not state["is_done"]:
             try:
                 audio_chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
@@ -57,26 +68,29 @@ async def listen_for_speech(silence_timeout: float = 0.5) -> str:
                 continue
 
             # Send to Sarvam STT
-            b64_audio = base64.b64encode(audio_chunk).decode("utf-8")
+            b64_audio = base64.b64encode(audio_chunk).decode("utf-8") #Sarvam expects base 64 string
+            #Streams audio chunks
             await asyncio.to_thread(stt_ws.transcribe, audio=b64_audio)
 
             # Silero VAD — process 512-sample sliding windows
+            #Prepares audio for VAD - converts floats back to float32, range [-1,1]
             samples = (
                 np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
                 / 32768.0
             )
             vad_buffer.extend(samples.tolist())
             while len(vad_buffer) >= VAD_WINDOW:
-                window = torch.tensor(vad_buffer[:VAD_WINDOW], dtype=torch.float32)
+                window = torch.tensor(vad_buffer[:VAD_WINDOW], dtype=torch.float32) #Silero exepcts pytorch tensor input.
                 vad_buffer[:] = vad_buffer[VAD_WINDOW:]
                 result = vad_iterator(window)
                 if result:
-                    vad_event_queue.put_nowait(result)
+                    vad_event_queue.put_nowait(result) # Push VAD Event - used later by monitor()
 
-    async def receiver(stt_ws):
+    async def receiver(stt_ws): #Receives streaming transcripts from Sarvam.
         while not state["is_done"]:
             try:
                 response = await asyncio.to_thread(stt_ws.recv)
+                #Checks valid transcript
                 if (
                     getattr(response, "type", None) == "data"
                     and response.data.transcript
@@ -115,7 +129,7 @@ async def listen_for_speech(silence_timeout: float = 0.5) -> str:
                 continue
             except Exception:
                 break
-
+    #Input stream + callback callback = pushes mic audio into audio_queue.
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
@@ -124,13 +138,13 @@ async def listen_for_speech(silence_timeout: float = 0.5) -> str:
         callback=callback,
     ):
         print("\nSpeak into the microphone...\n")
-
+        #Creates websocket connection to Sarvam API
         with client.speech_to_text_streaming.connect(
             model="saaras:v3",
-            language_code="hi-IN",
+            language_code="en-IN",
             mode="codemix",
             high_vad_sensitivity=True,
-        ) as stt_ws:
+        ) as stt_ws: # Created the object of sarvam websocket.
             sender_task = asyncio.create_task(sender(stt_ws))
             receiver_task = asyncio.create_task(receiver(stt_ws))
             await monitor()
