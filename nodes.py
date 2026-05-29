@@ -1,3 +1,4 @@
+import requests
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from agent_state import GraphState
@@ -6,10 +7,11 @@ from langchain_cerebras import ChatCerebras
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
+from langchain_groq import ChatGroq
 load_dotenv(override=True)
 CEREBRAS_API_KEY=os.getenv("CEREBRAS_API_KEY")
 client = ChatCerebras(model="gpt-oss-120b", api_key=CEREBRAS_API_KEY)
-
+from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
 USERNAME = "neo4j"
@@ -20,6 +22,69 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 
 print("Loading Reranking Model")
 reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+CLOUDFARE_ID = os.getenv("CLOUDFARE_ACCOUNT_ID")
+WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
+
+
+
+def general_generation_node(State: GraphState):
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    client = ChatGroq(model = "llama-3.1-8b-instant", api_key = GROQ_API_KEY)
+
+    tools = [get_weather, get_current_location]
+    llm_with_tools = client.bind_tools(tools)
+    question = State["question"]
+    system_prompt = f"""
+    You are a general purpose AI assistant.
+    If the user asks a general question, just answer it normally in plain text.
+    
+    HOWEVER, if someone asks about the weather, you MUST use the get_weather tool to fetch real data.
+    IMPORTANT: When calling a tool, do NOT output anything else. Just call the tool.
+    CRITICAL: You ONLY have access to `get_weather` and `get_current_location`. DO NOT attempt to use `brave_search` or any other tool that is not explicitly provided.
+    
+    If and ONLY if you are providing weather information, respond ONLY in the A2UI JSON format.
+    You have access to the following component in the frontend catalog:
+    - "WeatherCard": Requires props: {{"city": "str", "temperature": "num", "condition": "str"}}
+    Example weather output:
+    {{
+    "type": "WeatherCard",
+    "props": {{
+        "city": "Mumbai",
+        "temperature": 32,
+        "condition": "haze"
+    }}
+    }}
+    You have two tools get_weather and get_current_location : you are free to use those tools incase necessary.
+    """
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=question)]
+    
+    try:
+        response = llm_with_tools.invoke(messages)
+
+        while response.tool_calls:
+            messages.append(response)
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                if tool_name == "get_weather":
+                    tool_output = get_weather.invoke(tool_args)
+                elif tool_name == "get_current_location":
+                    tool_output = get_current_location.invoke(tool_args)
+                else:
+                    tool_output = "Unknown tool"
+                    
+                from langchain_core.messages import ToolMessage
+                messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
+                
+            response = llm_with_tools.invoke(messages)
+            
+        return {"answer": response.content}
+    except Exception as e:
+        print(f"LLM Generation Error: {e}")
+        return {"answer": "I'm sorry, but I couldn't process that request properly. Could you try rephrasing?"}
+
 
 """Retrieving node takes the question from user ( TypedDict class )->converts that question to a embedding_vector
  and then we search that vector with the closest vector in neo4j database. If no relevant data found then r
@@ -111,7 +176,8 @@ def retrieve_node(state:GraphState):
             candidates.append(record['context_string'])
 
     if not candidates:
-        return {"context": ""}
+        print("Semantic Router: No candidates found. Routing to General Agent.")
+        return {"context": "", "router": 1}
 
     # 4. Rerank candidates using CrossEncoder
     # Create question-candidate pairs using the normalized question
@@ -126,11 +192,18 @@ def retrieve_node(state:GraphState):
         print(f"Score {score:.4f} | {doc[:80]}...")
     print("----------------------------\n")
 
+    # Semantic Routing Logic: check if the best match is actually a good match
+    best_score = scored_candidates[0][1]
+    if best_score < 0.0:
+        print(f"Semantic Router: Best score {best_score:.4f} < 0.0. Routing to General Agent.")
+        return {"context": "", "router": 1}
+
+    print(f"Semantic Router: Best score {best_score:.4f} >= 0.0. Routing to Jio FAQ Agent.")
     # Select the top 3 best matching candidates
     top_candidates = [candidate for candidate, score in scored_candidates[:3]]
     
     retrieved_context = "\n".join(top_candidates) + "\n"
-    return {"context": retrieved_context}
+    return {"context": retrieved_context, "router": 2}
 
 def generate_node(state:GraphState):
     question = state["question"]
@@ -149,6 +222,10 @@ def generate_node(state:GraphState):
     {context}"""
 
     messages = [SystemMessage(content=system_prompt), HumanMessage(content = question)]
-    response = client.invoke(messages)
-
-    return {"answer":response.content}
+    
+    try:
+        response = client.invoke(messages)
+        return {"answer": response.content}
+    except Exception as e:
+        print(f"Cerebras API Error: {e}")
+        return {"answer": "The AI service is currently experiencing high traffic (Queue Exceeded). Please wait a few moments and try your question again!"}
