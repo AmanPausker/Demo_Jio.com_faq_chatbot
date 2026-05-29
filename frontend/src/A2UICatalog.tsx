@@ -11,9 +11,20 @@ const getWeatherImage = (condition) => {
     return '🌡️';
 };
 
-export const WeatherCard = ({
-    city, temperature, condition
-}) => (
+import { createComponentImplementation, basicCatalog } from '@a2ui/react/v0_9';
+import { Catalog } from '@a2ui/web_core/v0_9';
+import { z } from 'zod';
+
+const WeatherCardApi = {
+    name: 'WeatherCard',
+    schema: z.object({
+        city: z.string(),
+        temperature: z.number(),
+        condition: z.string(),
+    })
+};
+
+const WeatherCardImpl = createComponentImplementation(WeatherCardApi, ({ props }) => (
     <div style={{
         padding: '20px',
         border: '1px solid #e5e7eb',
@@ -28,19 +39,20 @@ export const WeatherCard = ({
         gap: '24px'
     }}>
         <div style={{ fontSize: '4rem', lineHeight: 1 }}>
-            {getWeatherImage(condition)}
+            {getWeatherImage(props.condition)}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold', margin: 0 }}>{city}</h2>
+            <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold', margin: 0 }}>{props.city}</h2>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
-                <span style={{ fontSize: '2.5rem', fontWeight: '600' }}>{temperature}°C</span>
-                <span style={{ color: '#4b5563', textTransform: 'capitalize', fontSize: '1.125rem' }}>{condition}</span>
+                <span style={{ fontSize: '2.5rem', fontWeight: '600' }}>{props.temperature}°C</span>
+                <span style={{ color: '#4b5563', textTransform: 'capitalize', fontSize: '1.125rem' }}>{props.condition}</span>
             </div>
         </div>
     </div>
-);
+));
 
-// Map the string name the LLM will output to your actual React Components.
-export const myCatalog = {
-    WeatherCard: WeatherCard,
-};
+export const myCatalog = new Catalog(
+    'https://example.com/my-catalog.json',
+    [...basicCatalog.components.values(), WeatherCardImpl],
+    basicCatalog.functions
+);

@@ -16,6 +16,45 @@ server.add_middleware(
     allow_headers=["*"],
 )
 
+import uuid
+import re
+import json
+
+def process_a2ui_messages(answer: str):
+    a2ui_msgs = []
+    surface_id = f"chat_{uuid.uuid4().hex[:8]}"
+    spoken_text = answer
+    new_answer = answer
+    
+    json_match = re.search(r'\{[\s\S]*\}', answer)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(0))
+            if "type" in parsed and parsed["type"] == "WeatherCard":
+                props = parsed.get("props", {})
+                spoken_text = f"The weather in {props.get('city', 'your location')} is {props.get('temperature', '')} degrees."
+                new_answer = f"Here is the weather information for {props.get('city', 'your location')}."
+                
+                a2ui_msgs = [
+                    {
+                        "version": "v0.9",
+                        "createSurface": { "surfaceId": surface_id, "catalogId": "https://example.com/my-catalog.json" }
+                    },
+                    {
+                        "version": "v0.9",
+                        "updateComponents": {
+                            "surfaceId": surface_id,
+                            "components": [
+                                { "id": "root", "component": "WeatherCard", **props }
+                            ]
+                        }
+                    }
+                ]
+        except Exception as e:
+            print(f"JSON Parse Error: {e}")
+            
+    return new_answer, spoken_text, a2ui_msgs, surface_id
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -29,11 +68,14 @@ async def chat(request: ChatRequest):
     initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
     final_state = await langgraph_app.ainvoke(initial_state)
     answer = final_state['answer']
+    new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
     
     # Disable TTS for text chat
     return {
-        "text": answer,
-        "audio_base64": None
+        "text": new_answer,
+        "audio_base64": None,
+        "a2ui_messages": a2ui_msgs,
+        "surface_id": surface_id
     }
 
 @server.post("/api/chat/audio")
@@ -57,24 +99,17 @@ async def chat_audio(audio: UploadFile = File(...)):
     final_state = await langgraph_app.ainvoke(initial_state)
     answer = final_state['answer']
     
-    import json
-    try:
-        parsed = json.loads(answer)
-        if "type" in parsed and parsed["type"] == "WeatherCard":
-            props = parsed.get("props", {})
-            spoken_text = f"The weather in {props.get('city', 'your location')} is {props.get('temperature', '')} degrees."
-        else:
-            spoken_text = "Here is the information you requested."
-    except json.JSONDecodeError:
-        spoken_text = answer
+    new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
         
     # Generate speech only for audio mode
     b64_audio = await generate_speech(spoken_text, return_base64=True)
     
     return {
-        "text": answer,
+        "text": new_answer,
         "user_message": user_message,
-        "audio_base64": b64_audio
+        "audio_base64": b64_audio,
+        "a2ui_messages": a2ui_msgs,
+        "surface_id": surface_id
     }
 
 if __name__ == "__main__":

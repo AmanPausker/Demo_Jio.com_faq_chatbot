@@ -1,6 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { floatToWavBlob } from "./utils/audioUtils"
 import { myCatalog } from './A2UICatalog';
+import { MessageProcessor } from '@a2ui/web_core/v0_9';
+import { A2uiSurface } from '@a2ui/react/v0_9';
+
+const processor = new MessageProcessor([myCatalog]);
 
 function App() {
   const [messages, setMessages] = useState([
@@ -74,7 +78,10 @@ function App() {
         });
 
         const data = await response.json();
-        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.text }]);
+        if (data.a2ui_messages && data.a2ui_messages.length > 0) {
+          processor.processMessages(data.a2ui_messages);
+        }
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id }]);
         playAudio(data.audio_base64);
       } catch (error) {
         console.error('Error:', error);
@@ -101,6 +108,9 @@ function App() {
         });
 
         const data = await response.json();
+        if (data.a2ui_messages && data.a2ui_messages.length > 0) {
+          processor.processMessages(data.a2ui_messages);
+        }
 
         setMessages(prev => {
           // Remove the temporary message
@@ -111,7 +121,7 @@ function App() {
           if (data.user_message) {
             newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `🎤 ${data.user_message}` });
           }
-          newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text });
+          newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id });
           return newMessages;
         });
 
@@ -348,23 +358,22 @@ function App() {
 
           <div className="voice-messages">
             {messages.map((msg) => {
-              let content = msg.text.replace('🎤 ', '');
-              if (msg.role === 'bot') {
-                try {
-                  const parsed = JSON.parse(msg.text);
-                  if (parsed.type && myCatalog[parsed.type]) {
-                    const Component = myCatalog[parsed.type];
-                    content = <Component {...parsed.props} />;
-                  }
-                } catch (e) {
-                  // Not JSON, render as text
+              let textContent = msg.text.replace('🎤 ', '');
+              let a2uiContent = null;
+              if (msg.role === 'bot' && msg.surfaceId) {
+                const surface = processor.model.getSurface(msg.surfaceId);
+                if (surface) {
+                  a2uiContent = <A2uiSurface surface={surface} />;
                 }
               }
 
               return (
                 <div key={msg.id} className={`voice-msg ${msg.role}`}>
                   <span className="voice-msg-author">{msg.role === 'user' ? 'You' : 'AI'}:</span>
-                  <span className="voice-msg-text">{content}</span>
+                  <span className="voice-msg-text">
+                    {textContent}
+                    {a2uiContent && <div style={{ marginTop: '8px' }}>{a2uiContent}</div>}
+                  </span>
                 </div>
               );
             })}
@@ -375,27 +384,25 @@ function App() {
         <>
           <div className="messages-area">
             {messages.map((msg) => {
-              let content = msg.text;
-              if (msg.role === 'bot') {
-                try {
-                  const parsed = JSON.parse(msg.text);
-                  if (parsed.type && myCatalog[parsed.type]) {
-                    const Component = myCatalog[parsed.type];
-                    content = <Component {...parsed.props} />;
-                  }
-                } catch (e) {
-                  // Not JSON, render as text
+              let a2uiContent = null;
+              if (msg.role === 'bot' && msg.surfaceId) {
+                const surface = processor.model.getSurface(msg.surfaceId);
+                if (surface) {
+                  a2uiContent = <A2uiSurface surface={surface} />;
                 }
               }
 
               return (
                 <div key={msg.id} className={`message-wrapper ${msg.role}`}>
-                  {typeof content === 'string' ? (
+                  {msg.text && (
                     <div className="message-bubble">
-                      {content}
+                      {msg.text}
                     </div>
-                  ) : (
-                    content
+                  )}
+                  {a2uiContent && (
+                    <div style={{ marginTop: '8px', maxWidth: '80%' }}>
+                      {a2uiContent}
+                    </div>
                   )}
                 </div>
               );

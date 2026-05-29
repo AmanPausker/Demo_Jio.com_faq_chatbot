@@ -43,7 +43,7 @@ def general_generation_node(State: GraphState):
     IMPORTANT: When calling a tool, do NOT output anything else. Just call the tool.
     CRITICAL: You ONLY have access to `get_weather` and `get_current_location`. DO NOT attempt to use `brave_search` or any other tool that is not explicitly provided.
     
-    If and ONLY if you are providing weather information, respond ONLY in the A2UI JSON format.
+    If and ONLY if you are providing weather information, respond ONLY with the raw A2UI JSON object. DO NOT include any markdown formatting, backticks, conversational text, or explanations. The output must be valid, parsable JSON and absolutely nothing else.
     You have access to the following component in the frontend catalog:
     - "WeatherCard": Requires props: {{"city": "str", "temperature": "num", "condition": "str"}}
     Example weather output:
