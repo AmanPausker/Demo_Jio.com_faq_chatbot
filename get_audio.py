@@ -11,9 +11,13 @@ import uuid
 
 async def generate_speech(input_text: str, **kwargs):
     """
-    Connects to Sarvam's TTS API, converts the input_text into speech,
-    and returns the audio data as a single tuple (sample_rate, numpy_data) 
-    for direct playback in Gradio.
+    * Takes text input
+    * Splits it into smaller chunks
+    * Sends chunks to the Sarvam AI TTS API
+    * Converts text → speech
+    * Downloads audio bytes
+    * Combines all audio chunks
+    * Returns playable audio
     """
     client = AsyncSarvamAI(api_subscription_key=API_KEY)
 
@@ -47,7 +51,7 @@ async def generate_speech(input_text: str, **kwargs):
         async def get_chunk(c, index):
             res = await client.text_to_speech.convert(
                 text=c,
-                target_language_code="en-IN",
+                target_language_code="hi-IN",
                 speaker="shubh",
                 model="bulbul:v3"
             )

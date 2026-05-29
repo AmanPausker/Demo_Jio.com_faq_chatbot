@@ -1,6 +1,7 @@
 import asyncio
 import sounddevice as sd
-import numpy as np # 1. Audio array manipulation, 2. converting float audio ->int16 PCM, 3. processing VAD samples
+import numpy as np 
+"""1. Audio array manipulation, 2. converting float audio ->int16 PCM, 3. processing VAD samples"""
 import base64 # sarvam websocket expects audio encoded as Base64 String
 from sarvamai import SarvamAI
 import os
@@ -157,14 +158,28 @@ async def transcribe_audio_file(file_path_or_bytes) -> str:
     from sarvamai import AsyncSarvamAI
     import tempfile
     import os
+    import subprocess
 
     async_client = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
 
     temp_file_path = None
     if isinstance(file_path_or_bytes, bytes):
-        fd, temp_file_path = tempfile.mkstemp(suffix=".wav")
-        with os.fdopen(fd, 'wb') as f:
+        fd_in, temp_in_path = tempfile.mkstemp(suffix=".tmp")
+        fd_out, temp_out_path = tempfile.mkstemp(suffix=".wav")
+        
+        with os.fdopen(fd_in, 'wb') as f:
             f.write(file_path_or_bytes)
+            
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", temp_in_path, "-ar", "16000", "-ac", "1", temp_out_path], check=True, capture_output=True)
+            temp_file_path = temp_out_path
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg error: {e.stderr}")
+            temp_file_path = temp_in_path
+        finally:
+            if os.path.exists(temp_in_path):
+                os.remove(temp_in_path)
+                
         file_path = temp_file_path
     else:
         file_path = file_path_or_bytes

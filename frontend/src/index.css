@@ -504,6 +504,10 @@ body {
   background: rgba(0, 0, 0, 0.2);
   border-radius: 20px;
   box-shadow: inset 0 0 10px rgba(0,0,0,0.3);
+  overflow-y: auto;
+  flex: 1;
+  max-height: 250px;
+  scroll-behavior: smooth;
 }
 
 .voice-msg {

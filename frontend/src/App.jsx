@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { floatToWavBlob } from "./utils/audioUtils"
+import { myCatalog } from './A2UICatalog';
 
 function App() {
   const [messages, setMessages] = useState([
@@ -346,24 +347,59 @@ function App() {
           </div>
 
           <div className="voice-messages">
-            {messages.slice(-3).map((msg) => (
-              <div key={msg.id} className={`voice-msg ${msg.role}`}>
-                <span className="voice-msg-author">{msg.role === 'user' ? 'You' : 'AI'}:</span>
-                <span className="voice-msg-text">{msg.text.replace('🎤 ', '')}</span>
-              </div>
-            ))}
+            {messages.map((msg) => {
+              let content = msg.text.replace('🎤 ', '');
+              if (msg.role === 'bot') {
+                try {
+                  const parsed = JSON.parse(msg.text);
+                  if (parsed.type && myCatalog[parsed.type]) {
+                    const Component = myCatalog[parsed.type];
+                    content = <Component {...parsed.props} />;
+                  }
+                } catch (e) {
+                  // Not JSON, render as text
+                }
+              }
+
+              return (
+                <div key={msg.id} className={`voice-msg ${msg.role}`}>
+                  <span className="voice-msg-author">{msg.role === 'user' ? 'You' : 'AI'}:</span>
+                  <span className="voice-msg-text">{content}</span>
+                </div>
+              );
+            })}
+            <div ref={messagesEndRef} />
           </div>
         </div>
       ) : (
         <>
           <div className="messages-area">
-            {messages.map((msg) => (
-              <div key={msg.id} className={`message-wrapper ${msg.role}`}>
-                <div className="message-bubble">
-                  {msg.text}
+            {messages.map((msg) => {
+              let content = msg.text;
+              if (msg.role === 'bot') {
+                try {
+                  const parsed = JSON.parse(msg.text);
+                  if (parsed.type && myCatalog[parsed.type]) {
+                    const Component = myCatalog[parsed.type];
+                    content = <Component {...parsed.props} />;
+                  }
+                } catch (e) {
+                  // Not JSON, render as text
+                }
+              }
+
+              return (
+                <div key={msg.id} className={`message-wrapper ${msg.role}`}>
+                  {typeof content === 'string' ? (
+                    <div className="message-bubble">
+                      {content}
+                    </div>
+                  ) : (
+                    content
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
             {isLoading && (
               <div className="message-wrapper bot">
                 <div className="message-bubble loading-dots">

@@ -30,12 +30,10 @@ async def chat(request: ChatRequest):
     final_state = await langgraph_app.ainvoke(initial_state)
     answer = final_state['answer']
     
-    # Generate speech
-    b64_audio = await generate_speech(answer, return_base64=True)
-    
+    # Disable TTS for text chat
     return {
         "text": answer,
-        "audio_base64": b64_audio
+        "audio_base64": None
     }
 
 @server.post("/api/chat/audio")
@@ -43,6 +41,10 @@ async def chat_audio(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
     
     user_message = await transcribe_audio_file(audio_bytes)
+    
+    import re
+    # Fix common Sarvam STT mistranscriptions
+    user_message = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', user_message)
     
     if not user_message.strip():
         return {
@@ -55,8 +57,19 @@ async def chat_audio(audio: UploadFile = File(...)):
     final_state = await langgraph_app.ainvoke(initial_state)
     answer = final_state['answer']
     
-    # Generate speech
-    b64_audio = await generate_speech(answer, return_base64=True)
+    import json
+    try:
+        parsed = json.loads(answer)
+        if "type" in parsed and parsed["type"] == "WeatherCard":
+            props = parsed.get("props", {})
+            spoken_text = f"The weather in {props.get('city', 'your location')} is {props.get('temperature', '')} degrees."
+        else:
+            spoken_text = "Here is the information you requested."
+    except json.JSONDecodeError:
+        spoken_text = answer
+        
+    # Generate speech only for audio mode
+    b64_audio = await generate_speech(spoken_text, return_base64=True)
     
     return {
         "text": answer,
