@@ -64,7 +64,10 @@ function ViewHeader({ title, onBack }) {
 }
 
 function App() {
+  const sessionIdRef = useRef(crypto.randomUUID());
+
   const [mode, setMode] = useState(null);
+
   const [messages, setMessages] = useState([
     { id: 1, role: 'bot', text: 'Hello! How can I help you today?' }
   ]);
@@ -270,7 +273,7 @@ function App() {
       const response = await fetch('http://localhost:8000/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg.text })
+        body: JSON.stringify({ message: userMsg.text, thread_id: sessionIdRef.current })
       });
       const data = await response.json();
       if (data.a2ui_messages && data.a2ui_messages.length > 0) {
@@ -292,6 +295,7 @@ function App() {
     setMessages(prev => [...prev, { id: tempId, role: 'user', text: '\uD83C\uDFA4 [Transcribing...]' }]);
     const formData = new FormData();
     formData.append('audio', audioBlob, 'recording.wav');
+    formData.append('thread_id', sessionIdRef.current);
     try {
       const response = await fetch('http://localhost:8000/api/chat/audio', {
         method: 'POST',

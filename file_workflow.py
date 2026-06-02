@@ -3,7 +3,18 @@ from docling.document_converter import DocumentConverter
 import uuid
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-qdrant_client = QdrantClient(path = "./qdrant_db")
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv(override = True)
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+qdrant_client = QdrantClient(
+    url = QDRANT_URL, 
+    api_key = QDRANT_API_KEY
+)
+
 COLLECTION_NAME="jio_documents"
 
 #Converting to Markdown instead of txt because markdown preserves the structure of the document.

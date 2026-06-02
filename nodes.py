@@ -58,7 +58,7 @@ def general_generation_node(State: GraphState):
     }}
     You have two tools get_weather and get_current_location : you are free to use those tools incase necessary.
     """
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=question)]
+    messages = [SystemMessage(content=system_prompt)] + State["messages"]
     
     try:
         response = llm_with_tools.invoke(messages)
@@ -81,7 +81,7 @@ def general_generation_node(State: GraphState):
                 
             response = llm_with_tools.invoke(messages)
             
-        return {"answer": response.content}
+        return {"answer": response.content, "messages":[response]}
     except Exception as e:
         print(f"LLM Generation Error: {e}")
         return {"answer": "I'm sorry, but I couldn't process that request properly. Could you try rephrasing?"}
@@ -226,11 +226,11 @@ def generate_node(state:GraphState):
     CONTEXT:
     {context}"""
 
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content = question)]
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
     
     try:
         response = client.invoke(messages)
-        return {"answer": response.content}
+        return {"answer": response.content, "messages":[response]}
     except Exception as e:
         print(f"Cerebras API Error: {e}")
         return {"answer": "The AI service is currently experiencing high traffic (Queue Exceeded). Please wait a few moments and try your question again!"}

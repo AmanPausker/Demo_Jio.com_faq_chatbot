@@ -12,6 +12,8 @@ A protocol that lets the LLM embed rich UI cards (e.g., weather widgets) in its 
 3. Frontend `MessageProcessor` (`@a2ui/web_core`) processes these messages
 4. `<A2uiSurface>` renders the registered `WeatherCard` component
 5. Component registration in `frontend/src/A2UICatalog.tsx` using `createComponentImplementation` + Zod schema
+6. (A Zod schema is a way to define and validate the shape of data in JavaScript or TypeScript using the library Zod.
+Think of it as a blueprint for your data—it describes what your data should look like and automatically checks that it matches.)
 
 **Files:** `nodes.py`, `server.py`, `frontend/src/App.jsx`, `frontend/src/A2UICatalog.tsx`
 
