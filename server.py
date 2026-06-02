@@ -15,8 +15,11 @@ server.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+import os
+import shutil
 import uuid
+from file_workflow import converter_pdf, create_chunking, create_embeddings, store_in_qdrant
+
 import re
 import json
 
@@ -112,6 +115,89 @@ async def chat_audio(audio: UploadFile = File(...)):
         "surface_id": surface_id
     }
 
+@server.post("/api/upload")
+async def upload_document(file: UploadFile = File()):
+    if not file.filename.endswith(".pdf"):
+        return {"error":"Only PDF files are supported."}
+
+    temp_file_path = f"temp_{uuid.uuid4().hex}_{file.filename}"
+    try:
+        file_bytes = await file.read()
+        with open(temp_file_path, "wb") as buffer:
+            buffer.write(file_bytes)
+        document_id = str(uuid.uuid4())
+        markdown_text = converter_pdf(temp_file_path)
+        chunks = create_chunking(markdown_text, document_id)
+        embeddings = create_embeddings(chunks)
+
+        store_in_qdrant(chunks, embeddings)
+
+        return {"success": True, "message": f"Successfully processed {len(chunks)} chunks from {file.filename}!"}
+    except Exception as e:
+        return {"error": f"Failed to process file: {str(e)}"}
+    finally:
+        if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)  #remove the temporary file.
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+CLOUDFARE_ID = os.getenv("CLOUDFARE_ACCOUNT_ID")
+WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
+
+kimi_vision_llm = ChatOpenAI(
+    api_key=WORKERS_API_KEY,
+    base_url=f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFARE_ID}/ai/v1",
+    model="@cf/moonshotai/kimi-k2.6",
+    max_tokens=1000
+)
+@server.post("/api/vision")
+async def analyze_image(image: UploadFile=File(...)):
+    try:
+        #Read the uploaded image bytes and convert to Base64.File
+        image_bytes = await image.read()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        mime_type = image.content_type or "image/jpeg"
+        message = HumanMessage(
+                content=[
+                    {"type": "text", "text": "You are a helpful Assistant. Describe this image in detail and tell the user."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_image}"
+                        },
+                    },
+                ]
+            )
+        response = kimi_vision_llm.invoke([message])
+        return {"success":True, "text":response.content}
+    except Exception as e:
+        return {"error":str(e)}
+import requests
+from pydantic import BaseModel
+
+class ImageRequest(BaseModel):
+    prompt :str
+@server.post("/api/generate_image")
+def generate_image(request:ImageRequest):
+    URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFARE_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    headers = {
+        "Authorization": f"Bearer {WORKERS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.post(URL, headers = headers, json= {"prompt":request.prompt})
+        if response.status_code == 200:
+            result = response.json().get("result")
+            image_base64 = result.get("image")
+            return {"success": True, "image_base64" : image_base64}
+        else:
+            return {"error":f"Cloudfare Error:{response.text}"}
+    except Exception as e:
+        return {"error":str(e)}
+
+import base64
+import os
 if __name__ == "__main__":
+
     import uvicorn
-    uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=False)
