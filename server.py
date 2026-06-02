@@ -1,12 +1,34 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 from app import app as langgraph_app
 from get_audio import generate_speech
 from get_transcript import transcribe_audio_file
-
+import base64
+import os
 server = FastAPI(title="Jio FAQ Bot API")
+from app import workflow
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import os
+load_dotenv(override=True)
+
+SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = authorization.split(" ")[1]
+    try:
+        user_response = supabase.auth.get_user(token)
+        return user_response.user.id
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 server.add_middleware(
     CORSMiddleware,
@@ -22,6 +44,22 @@ from file_workflow import converter_pdf, create_chunking, create_embeddings, sto
 
 import re
 import json
+
+def process_pdf_background(temp_file_path: str, filename: str):
+    try:
+        document_id = str(uuid.uuid4())
+        markdown_text = converter_pdf(temp_file_path)
+        chunks = create_chunking(markdown_text, document_id)
+        embeddings = create_embeddings(chunks)
+        store_in_qdrant(chunks, embeddings)
+        print(f"Background processing finished for {filename}!")
+    except Exception as e:
+        print(f"Background processing failed for {filename}: {e}")
+    finally:
+        #Cleaning up the temporary file.
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
 
 def process_a2ui_messages(answer: str):
     a2ui_msgs = []
@@ -60,23 +98,26 @@ def process_a2ui_messages(answer: str):
 
 class ChatRequest(BaseModel):
     message: str
-    thread_id : str = None
 
 @server.post("/api/chat")
-async def chat(request: ChatRequest):
-    thread_id = request.thread_id or "default_session"
-    config = {"configurable":{"thread_id":thread_id}}
+async def chat(request: ChatRequest, user_id: str = Depends(get_current_user)):
+    config = {"configurable": {"thread_id": user_id}}
     user_message = request.message
     
     if not user_message.strip():
         return {"text": "Please enter a message.", "audio_base64": None}
     
     initial_state = {"question":user_message, "messages":[("user", user_message)], "context":"", "answer":""}
-    final_state = await langgraph_app.ainvoke(initial_state, config = config)
+    
+    # MAGIC HAPPENS HERE
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        langgraph_app = workflow.compile(checkpointer=memory)
+        final_state = await langgraph_app.ainvoke(initial_state, config = config)
+        
     answer = final_state['answer']
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
-    
-    # Disable TTS for text chat
+    # ... return response ...
+
     return {
         "text": new_answer,
         "audio_base64": None,
@@ -85,7 +126,7 @@ async def chat(request: ChatRequest):
     }
 
 @server.post("/api/chat/audio")
-async def chat_audio(audio: UploadFile = File(...), thread_id : str = Form(None)):
+async def chat_audio(audio: UploadFile = File(...), user_id: str = Depends(get_current_user)):
     
     audio_bytes = await audio.read()
     
@@ -102,8 +143,7 @@ async def chat_audio(audio: UploadFile = File(...), thread_id : str = Form(None)
             "audio_base64": None
         }
         
-    t_id = thread_id or "default_session"
-    config = {"configurable": {"thread_id": t_id}}
+    config = {"configurable": {"thread_id": user_id}}
     
     initial_state = {
         "question": user_message, 
@@ -112,7 +152,10 @@ async def chat_audio(audio: UploadFile = File(...), thread_id : str = Form(None)
         "answer": ""
     }
     
-    final_state = await langgraph_app.ainvoke(initial_state, config=config)
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        langgraph_app = workflow.compile(checkpointer=memory)
+        final_state = await langgraph_app.ainvoke(initial_state, config=config)
+        
     answer = final_state['answer']
     
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
@@ -129,7 +172,7 @@ async def chat_audio(audio: UploadFile = File(...), thread_id : str = Form(None)
     }
 
 @server.post("/api/upload")
-async def upload_document(file: UploadFile = File()):
+async def upload_document(background_tasks : BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         return {"error":"Only PDF files are supported."}
 
@@ -138,19 +181,11 @@ async def upload_document(file: UploadFile = File()):
         file_bytes = await file.read()
         with open(temp_file_path, "wb") as buffer:
             buffer.write(file_bytes)
-        document_id = str(uuid.uuid4())
-        markdown_text = converter_pdf(temp_file_path)
-        chunks = create_chunking(markdown_text, document_id)
-        embeddings = create_embeddings(chunks)
+        background_tasks.add_task(process_pdf_background, temp_file_path, file.filename)
+        return {"success": True, "message": f"{file.filename} is uploading and being processed in the background!"}
 
-        store_in_qdrant(chunks, embeddings)
-
-        return {"success": True, "message": f"Successfully processed {len(chunks)} chunks from {file.filename}!"}
     except Exception as e:
         return {"error": f"Failed to process file: {str(e)}"}
-    finally:
-        if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)  #remove the temporary file.
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -190,15 +225,18 @@ from pydantic import BaseModel
 
 class ImageRequest(BaseModel):
     prompt :str
+import httpx
+
 @server.post("/api/generate_image")
-def generate_image(request:ImageRequest):
+async def generate_image(request:ImageRequest):
     URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFARE_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     headers = {
         "Authorization": f"Bearer {WORKERS_API_KEY}",
         "Content-Type": "application/json"
     }
     try:
-        response = requests.post(URL, headers = headers, json= {"prompt":request.prompt})
+        async with httpx.AsyncClient() as client:
+            response = await client.post(URL, headers = headers, json= {"prompt":request.prompt})
         if response.status_code == 200:
             result = response.json().get("result")
             image_base64 = result.get("image")
@@ -214,3 +252,5 @@ if __name__ == "__main__":
 
     import uvicorn
     uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=False)
+
+
