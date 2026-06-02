@@ -6,10 +6,15 @@ import { A2uiSurface } from '@a2ui/react/v0_9';
 
 const processor = new MessageProcessor([myCatalog]);
 
+
 function App() {
   const [messages, setMessages] = useState([
     { id: 1, role: 'bot', text: 'Hello! Ask me anything about Jio Plans, 5G, or services.' }
   ]);
+  const fileInputRef = useRef(null);
+  const imageInputRef = useRef(null);
+  const [isImageUploading, setIsImageUploading] = useState(false);
+  const [isUploading, setIsUpLoading] = useState(false);
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -39,6 +44,82 @@ function App() {
       }).catch(() => { });
     }
   };
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    setIsUpLoading(true);
+    const tempId = crypto.randomUUID();
+    setMessages(prev => [...prev, { id: tempId, role: 'bot', text: `📁 Uploading and processing ${file.name}...` }]);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const response = await fetch('http://localhost:8000/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await response.json();
+
+      setMessages(prev => {
+        const filtered = prev.filter(m => m.id !== tempId);
+        if (data.success) {
+          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: `✅ ${data.message}` }];
+
+        } else {
+          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: `❌ Upload failed: ${data.error}` }];
+        }
+      });
+    } catch (error) {
+      console.error("Upload error", error);
+      setMessages(prev => {
+        const filtered = prev.filter(m => m.id !== tempId);
+        return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: '❌ Failed to connect to server during upload.' }]
+      });
+    } finally {
+      setIsUpLoading(false); // reset the file input so the same file can be selected again if needed.
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+  const handleImageUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    setIsImageUploading(true);
+    const tempId = crypto.randomUUID();
+    // Add two messages: one showing the user uploaded an image, one for the bot "thinking"
+    setMessages(prev => [
+      ...prev,
+      { id: crypto.randomUUID(), role: 'user', text: `🖼️ Uploaded Image: ${file.name}` },
+      { id: tempId, role: 'bot', text: `👁️ Analyzing image using Kimi K2.6...` }
+    ]);
+    const formData = new FormData();
+    formData.append("image", file);
+    try {
+      const response = await fetch('http://localhost:8000/api/vision', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await response.json();
+      setMessages(prev => {
+        const filtered = prev.filter(m => m.id !== tempId);
+        if (data.success) {
+          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: data.text }];
+        } else {
+          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: `❌ Vision failed: ${data.error}` }];
+        }
+      });
+
+    }
+    catch (error) {
+      console.error("Image upload error", error);
+      setMessages(prev => {
+        const filtered = prev.filter(m => m.id !== tempId);
+        return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: '❌ Failed to connect to vision server.' }];
+      });
+    } finally {
+      setIsImageUploading(false);
+      if (imageInputRef.current) imageInputRef.current.value = '';
+    }
+
+  };
 
   const playAudio = (base64Audio) => {
     if (!base64Audio || !audioPlayerRef.current) return;
@@ -57,7 +138,42 @@ function App() {
     audioPlayerRef.current.play().catch(e => {
       console.error("Audio playback failed", e);
       setIsPlaying(false);
+
     });
+  };
+  const handleGenerateImage = async () => {
+    if (!inputText.trim()) return;
+    const prompt = inputText;
+
+    unlockAudio();
+    // Show the user's prompt in the chat
+    setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: `🎨 Create image: ${prompt}` }]);
+    setInputText('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/api/generate_image', {
+        method: "POST",
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: prompt })
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        setMessages(prev => [...prev, {
+          id: crypto.randomUUID(),
+          role: 'bot',
+          text: `✨ Here is your image for: "${prompt}"`,
+          image: `data:image/jpeg;base64,${data.image_base64}`
+        }]);
+      } else {
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: `❌ Image failed: ${data.error}` }]);
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: '❌ Failed to connect to server.' }]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleSendText = async () => {
@@ -65,78 +181,108 @@ function App() {
 
     unlockAudio();
 
-      const userMsg = { id: crypto.randomUUID(), role: 'user', text: inputText };
-      setMessages(prev => [...prev, userMsg]);
-      setInputText('');
-      setIsLoading(true);
+    const userMsg = { id: crypto.randomUUID(), role: 'user', text: inputText };
+    setMessages(prev => [...prev, userMsg]);
+    setInputText('');
+    setIsLoading(true);
 
+    // --- INTERCEPT /imagine COMMAND ---
+    if (userMsg.text.startsWith('/imagine ')) {
+      const prompt = userMsg.text.replace('/imagine ', '');
       try {
-        const response = await fetch('http://localhost:8000/api/chat', {
-          method: 'POST',
+        const response = await fetch('http://localhost:8000/api/generate_image', {
+          method: "POST",
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: userMsg.text })
+          body: JSON.stringify({ prompt: prompt })
         });
-
         const data = await response.json();
-        if (data.a2ui_messages && data.a2ui_messages.length > 0) {
-          processor.processMessages(data.a2ui_messages);
+
+        if (data.success) {
+          setMessages(prev => [...prev, {
+            id: crypto.randomUUID(),
+            role: 'bot',
+            text: `✨ Here is your image for: "${prompt}"`,
+            image: `data:image/jpeg;base64,${data.image_base64}`
+          }]);
+        } else {
+          setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: `❌ Image failed: ${data.error}` }]);
         }
-        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id }]);
-        playAudio(data.audio_base64);
       } catch (error) {
-        console.error('Error:', error);
-        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error.' }]);
+        setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: '❌ Failed to connect to server.' }]);
       } finally {
         setIsLoading(false);
       }
-    };
+      return; // Stop here so it doesn't run the normal chat code!
+    }
 
-    const sendAudioMessage = async (audioBlob) => {
-      setIsLoading(true);
+    // --- NORMAL CHAT ---
+    try {
+      const response = await fetch('http://localhost:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMsg.text })
+      });
 
-      // Add a temporary placeholder so the user knows they stopped talking and it's processing
-      const tempId = crypto.randomUUID();
-      setMessages(prev => [...prev, { id: tempId, role: 'user', text: `🎤 [Transcribing...]` }]);
-
-      const formData = new FormData();
-      formData.append('audio', audioBlob, 'recording.wav');
-
-      try {
-        const response = await fetch('http://localhost:8000/api/chat/audio', {
-          method: 'POST',
-          body: formData
-        });
-
-        const data = await response.json();
-        if (data.a2ui_messages && data.a2ui_messages.length > 0) {
-          processor.processMessages(data.a2ui_messages);
-        }
-
-        setMessages(prev => {
-          // Remove the temporary message
-          const filtered = prev.filter(m => m.id !== tempId);
-
-          // Add the real transcribed user message and the bot's response
-          const newMessages = [...filtered];
-          if (data.user_message) {
-            newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `🎤 ${data.user_message}` });
-          }
-          newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id });
-          return newMessages;
-        });
-
-        playAudio(data.audio_base64);
-
-      } catch (error) {
-        console.error('Error:', error);
-        setMessages(prev => {
-          const filtered = prev.filter(m => m.id !== tempId);
-          return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error processing your audio.' }];
-        });
-      } finally {
-        setIsLoading(false);
+      const data = await response.json();
+      if (data.a2ui_messages && data.a2ui_messages.length > 0) {
+        processor.processMessages(data.a2ui_messages);
       }
-    };
+      setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id }]);
+      playAudio(data.audio_base64);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error.' }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const sendAudioMessage = async (audioBlob) => {
+    setIsLoading(true);
+
+    // Add a temporary placeholder so the user knows they stopped talking and it's processing
+    const tempId = crypto.randomUUID();
+    setMessages(prev => [...prev, { id: tempId, role: 'user', text: `🎤 [Transcribing...]` }]);
+
+    const formData = new FormData();
+    formData.append('audio', audioBlob, 'recording.wav');
+
+    try {
+      const response = await fetch('http://localhost:8000/api/chat/audio', {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await response.json();
+      if (data.a2ui_messages && data.a2ui_messages.length > 0) {
+        processor.processMessages(data.a2ui_messages);
+      }
+
+      setMessages(prev => {
+        // Remove the temporary message
+        const filtered = prev.filter(m => m.id !== tempId);
+
+        // Add the real transcribed user message and the bot's response
+        const newMessages = [...filtered];
+        if (data.user_message) {
+          newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `🎤 ${data.user_message}` });
+        }
+        newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id });
+        return newMessages;
+      });
+
+      playAudio(data.audio_base64);
+
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages(prev => {
+        const filtered = prev.filter(m => m.id !== tempId);
+        return [...filtered, { id: crypto.randomUUID(), role: 'bot', text: 'Sorry, I encountered an error processing your audio.' }];
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   // Manual Push-to-Talk for Text Mode
   const startRecording = async () => {
@@ -399,6 +545,12 @@ function App() {
                       {msg.text}
                     </div>
                   )}
+                  {msg.image && (
+                    <img src={msg.image}
+                      alt="AI Generated"
+                      style={{ maxWidth: '100%', borderRadius: '12px', marginTop: '8px' }}
+                    />
+                  )}
                   {a2uiContent && (
                     <div style={{ marginTop: '8px', maxWidth: '80%' }}>
                       {a2uiContent}
@@ -418,6 +570,29 @@ function App() {
           </div>
 
           <div className="input-area">
+            {/* Hidden file input. */}
+            <input
+              type="file"
+              accept=".pdf"
+              style={{ display: 'none' }}
+              ref={fileInputRef} onChange={handleFileUpload}
+            />
+            {/* Hidden image input */}
+            <input type="file" accept="image/*" style={{ display: 'none' }}
+              ref={imageInputRef} onChange={handleImageUpload}
+            />
+            {/*Image upload button */}
+            <button className="icon-button" onClick={() => imageInputRef.current?.click()}
+              disabled={isLoading || isRecording || vadLoading || isUploading || isImageUploading} title="Upload Image"
+              style={{ marginRight: "8px" }}>🖼️ </button>
+
+            {/* Upload Button */}
+            <button className="icon-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading || isRecording || vadLoading || isUploading}
+              title="Upload PDF"
+              style={{ marginRight: "8px" }} // tiny space
+            >📁</button>
             <input
               type="text"
               className="chat-input"

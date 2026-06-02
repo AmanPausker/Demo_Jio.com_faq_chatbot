@@ -7,6 +7,7 @@ from langchain_cerebras import ChatCerebras
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
+from file_workflow import search_qdrant
 from langchain_groq import ChatGroq
 load_dotenv(override=True)
 CEREBRAS_API_KEY=os.getenv("CEREBRAS_API_KEY")
@@ -174,7 +175,11 @@ def retrieve_node(state:GraphState):
         result = session.run(cypher_query, question_embedding=question_vector, keyword_query=keyword_query)
         for record in result:
             candidates.append(record['context_string'])
-
+    qdrant_results = search_qdrant(question_vector)
+    for chunk in qdrant_results:
+        # We wrap it in a string so the LLM knows where it came from
+        candidates.append(f"Uploaded Document Context: {chunk}")
+        
     if not candidates:
         print("Semantic Router: No candidates found. Routing to General Agent.")
         return {"context": "", "router": 1}
