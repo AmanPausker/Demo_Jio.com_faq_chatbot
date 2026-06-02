@@ -60,16 +60,19 @@ def process_a2ui_messages(answer: str):
 
 class ChatRequest(BaseModel):
     message: str
+    thread_id : str = None
 
 @server.post("/api/chat")
 async def chat(request: ChatRequest):
+    thread_id = request.thread_id or "default_session"
+    config = {"configurable":{"thread_id":thread_id}}
     user_message = request.message
     
     if not user_message.strip():
         return {"text": "Please enter a message.", "audio_base64": None}
     
-    initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
-    final_state = await langgraph_app.ainvoke(initial_state)
+    initial_state = {"question":user_message, "messages":[("user", user_message)], "context":"", "answer":""}
+    final_state = await langgraph_app.ainvoke(initial_state, config = config)
     answer = final_state['answer']
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
     
@@ -82,7 +85,8 @@ async def chat(request: ChatRequest):
     }
 
 @server.post("/api/chat/audio")
-async def chat_audio(audio: UploadFile = File(...)):
+async def chat_audio(audio: UploadFile = File(...), thread_id : str = Form(None)):
+    
     audio_bytes = await audio.read()
     
     user_message = await transcribe_audio_file(audio_bytes)
@@ -98,8 +102,17 @@ async def chat_audio(audio: UploadFile = File(...)):
             "audio_base64": None
         }
         
-    initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
-    final_state = await langgraph_app.ainvoke(initial_state)
+    t_id = thread_id or "default_session"
+    config = {"configurable": {"thread_id": t_id}}
+    
+    initial_state = {
+        "question": user_message, 
+        "messages": [("user", user_message)], 
+        "context": "", 
+        "answer": ""
+    }
+    
+    final_state = await langgraph_app.ainvoke(initial_state, config=config)
     answer = final_state['answer']
     
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
