@@ -3,6 +3,8 @@ import { floatToWavBlob } from "./utils/audioUtils"
 import { myCatalog } from './A2UICatalog';
 import { MessageProcessor } from '@a2ui/web_core/v0_9';
 import { A2uiSurface } from '@a2ui/react/v0_9';
+import { supabase } from './supabaseClient';
+import Auth from './Auth';
 
 const processor = new MessageProcessor([myCatalog]);
 
@@ -64,7 +66,21 @@ function ViewHeader({ title, onBack }) {
 }
 
 function App() {
-  const sessionIdRef = useRef(crypto.randomUUID());
+  const [session, setSession] = useState(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session)
+    })
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session)
+    })
+
+    return () => subscription.unsubscribe()
+  }, [])
 
   const [mode, setMode] = useState(null);
 
@@ -272,8 +288,11 @@ function App() {
     try {
       const response = await fetch('http://localhost:8000/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg.text, thread_id: sessionIdRef.current })
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`
+        },
+        body: JSON.stringify({ message: userMsg.text })
       });
       const data = await response.json();
       if (data.a2ui_messages && data.a2ui_messages.length > 0) {
@@ -295,10 +314,12 @@ function App() {
     setMessages(prev => [...prev, { id: tempId, role: 'user', text: '\uD83C\uDFA4 [Transcribing...]' }]);
     const formData = new FormData();
     formData.append('audio', audioBlob, 'recording.wav');
-    formData.append('thread_id', sessionIdRef.current);
     try {
       const response = await fetch('http://localhost:8000/api/chat/audio', {
         method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${session?.access_token}`
+        },
         body: formData
       });
       const data = await response.json();
@@ -451,6 +472,10 @@ function App() {
     };
   }, [mode]);
 
+  if (!session) {
+    return <div className="chat-container"><Auth setSession={setSession} /></div>
+  }
+
   return (
     <div className="chat-container">
       {mode === null ? (
@@ -458,6 +483,7 @@ function App() {
           <div className="home-header">
             <h1>AI Assistant</h1>
             <p>How would you like to interact?</p>
+            <button className="secondary-button" onClick={() => supabase.auth.signOut()} style={{ marginTop: '12px' }}>Sign Out</button>
           </div>
           <div className="option-grid">
             <button className="option-card" onClick={() => setMode('text')}>

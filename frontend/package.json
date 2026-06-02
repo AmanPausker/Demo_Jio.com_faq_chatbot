@@ -13,6 +13,7 @@
     "@a2ui/react": "^0.10.0",
     "@a2ui/web_core": "^0.10.0",
     "@ricky0123/vad-web": "^0.0.30",
+    "@supabase/supabase-js": "^2.106.2",
     "onnxruntime-web": "^1.26.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
