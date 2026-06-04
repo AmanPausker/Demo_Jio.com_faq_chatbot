@@ -34,6 +34,8 @@ from typing import TypedDict, List, Optional
 class Chunk(TypedDict):
     chunk_id: str
     document_id: str
+    user_id: str
+    session_id: str
     text: str
     page_number: Optional[int]
     section: Optional[str]
@@ -42,7 +44,7 @@ class Chunk(TypedDict):
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
    
-def create_chunking(markdown :str, document_id:str)->List[Chunk]:
+def create_chunking(markdown :str, document_id:str, user_id:str, session_id:str)->List[Chunk]:
     splitter = RecursiveCharacterTextSplitter(chunk_size = 1000, chunk_overlap=200)
     chunks = splitter.split_text(markdown)
     chunk_list:List[Chunk] = []
@@ -51,6 +53,8 @@ def create_chunking(markdown :str, document_id:str)->List[Chunk]:
         chunk_data = {
             "chunk_id":str(uuid.uuid4()),
             "document_id":document_id,
+            "user_id":user_id,
+            "session_id":session_id,
             "text":chunk,
             "page_number":None,
             "section":None
@@ -71,11 +75,27 @@ def create_embeddings(chunks: list[Chunk]) -> list[list[float]]:
     return embeddings.tolist()
 
 def init_qdrant():
-    """Create collection if it doesnt exist."""
+    """Create collection if it doesnt exist, and ensure payload indexes."""
     try:
         qdrant_client.get_collection(COLLECTION_NAME)
     except Exception:
         qdrant_client.create_collection(collection_name = COLLECTION_NAME, vectors_config = models.VectorParams(size=384, distance = models.Distance.COSINE), )
+        
+    try:
+        # Create an index for user_id to allow filtering
+        qdrant_client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="user_id",
+            field_schema=models.PayloadSchemaType.KEYWORD
+        )
+        # Create an index for session_id to allow session-level filtering
+        qdrant_client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="session_id",
+            field_schema=models.PayloadSchemaType.KEYWORD
+        )
+    except Exception as e:
+        pass
 init_qdrant()
 
 def store_in_qdrant(chunks:list[Chunk], embeddings:list[list[float]]):
@@ -85,6 +105,8 @@ def store_in_qdrant(chunks:list[Chunk], embeddings:list[list[float]]):
         point=models.PointStruct(id = chunk["chunk_id"],
         vector = embedding, payload = {
                 "document_id": chunk["document_id"],
+                "user_id": chunk["user_id"],
+                "session_id": chunk["session_id"],
                 "text": chunk["text"],
                 "page_number": chunk.get("page_number"),
                 "section": chunk.get("section")
@@ -94,11 +116,22 @@ def store_in_qdrant(chunks:list[Chunk], embeddings:list[list[float]]):
     qdrant_client.upsert(collection_name=COLLECTION_NAME, points = points)
 
 
-def search_qdrant(query_vector:list[float], limit:int =5) -> list[str]:
-    """Search Qdrant using a pre-computed vector and return text chunks."""
+def search_qdrant(query_vector:list[float], user_id:str, session_id:str, limit:int =5) -> list[str]:
+    """Search Qdrant using a pre-computed vector and return text chunks belonging to the specific user and session."""
 
     try:
-        search_response = qdrant_client.query_points(collection_name = COLLECTION_NAME, query = query_vector, limit= limit)
+        search_filter = models.Filter(
+            must=[
+                models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
+                models.FieldCondition(key="session_id", match=models.MatchValue(value=session_id))
+            ]
+        )
+        search_response = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME, 
+            query=query_vector, 
+            query_filter=search_filter,
+            limit=limit
+        )
         return [hit.payload["text"] for hit in search_response.points]
     except Exception as e:
         print(f"Qdrant search skipped: {e}")
