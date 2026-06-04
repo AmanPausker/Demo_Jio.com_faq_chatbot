@@ -3,11 +3,6 @@ from langgraph.graph import StateGraph, START, END
 from agent_state import GraphState
 from nodes import retrieve_node, generate_node, general_generation_node
 
-import sqlite3
-from langgraph.checkpoint.sqlite import SqliteSaver
-conn = sqlite3.connect("checkpoints.db", check_same_thread = False)
-memory = SqliteSaver(conn)
-
 workflow = StateGraph(GraphState)
 
 
@@ -30,7 +25,7 @@ workflow.add_conditional_edges("retrieve", route_request, {
 workflow.add_edge('generate', END)
 workflow.add_edge('general_generation', END)
 
-app = workflow.compile(checkpointer = memory)
+
 
 from get_transcript import listen_for_speech
 

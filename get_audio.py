@@ -90,3 +90,60 @@ async def generate_speech(input_text: str, **kwargs):
         print(f"Error generating speech: {e}")
 
     return None
+
+async def generate_speech_stream(text: str):
+    """Generate TTS and yield base64 WAV chunks as they arrive."""
+    import aiohttp
+    import os
+    import re
+    import asyncio
+
+    api_key = os.getenv("SARVAM_API_KEY")
+    url = "https://api.sarvam.ai/text-to-speech"
+
+    # Split into sentences for parallel requests
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    for sentence in sentences:
+        if len(sentence) > 200:
+            # Further split
+            words = sentence.split()
+            for i in range(0, len(words), 30):
+                chunks.append(" ".join(words[i:i+30]))
+        else:
+            if sentence.strip():
+                chunks.append(sentence.strip())
+
+    if not chunks and text.strip():
+        chunks = [text.strip()]
+
+    # Send requests in parallel
+    async def fetch_chunk(chunk_text):
+        payload = {
+            "inputs": [chunk_text],
+            "target_language_code": "hi-IN",
+            "speaker": "shubh",
+            "pitch": 0,
+            "pace": 1.0,
+            "model": "bulbul:v3"
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers={"api-subscription-key": api_key}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "audios" in data and data["audios"]:
+                            return data["audios"][0]  # base64 WAV
+        except Exception as e:
+            print(f"TTS Streaming Error: {e}")
+        return None
+
+    # Start all requests concurrently
+    tasks = [asyncio.create_task(fetch_chunk(chunk)) for chunk in chunks]
+    
+    # Yield in order to maintain sentence sequence
+    for task in tasks:
+        result = await task
+        if result:
+            yield result
+
