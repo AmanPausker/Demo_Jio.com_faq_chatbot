@@ -189,7 +189,7 @@ async def transcribe_audio_file(file_path_or_bytes) -> str:
             res = await async_client.speech_to_text.transcribe(
                 file=file_obj,
                 model="saaras:v3",
-                language_code="hi-IN",
+                language_code="en-IN",
                 mode="codemix",
             )
             return res.transcript

@@ -8,4 +8,7 @@ class GraphState(TypedDict):
     question:str #Question asked by user
     context :str #Retreived context from neo4j
     answer:str #Final Answer that the LLM generates
+    long_term_memory: str # Persisted user facts across sessions
+    user_id: str # Current user ID
+    token: str # Current user's JWT token
 
