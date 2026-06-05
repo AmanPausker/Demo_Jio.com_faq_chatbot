@@ -199,3 +199,36 @@ async def transcribe_audio_file(file_path_or_bytes) -> str:
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
+
+async def transcribe_pcm(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> str:
+    """Transcribe raw PCM int16 audio directly, no temp files or ffmpeg needed.
+    
+    Wraps PCM data with a WAV header in-memory and sends to Sarvam REST API.
+    """
+    from sarvamai import AsyncSarvamAI
+    import io
+    import wave
+    import os
+
+    async_client = AsyncSarvamAI(api_subscription_key=os.getenv("SARVAM_API_KEY"))
+
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+
+    wav_io.seek(0)
+    try:
+        res = await async_client.speech_to_text.transcribe(
+            file=wav_io,
+            model="saaras:v3",
+            language_code="en-IN",
+            mode="codemix",
+        )
+        return res.transcript
+    except Exception as e:
+        print(f"STT Error (pcm): {e}")
+        return ""
