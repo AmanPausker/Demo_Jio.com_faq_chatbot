@@ -91,9 +91,18 @@ async def generate_speech(input_text: str, **kwargs):
 
     return None
 
+_shared_session = None
+
+async def _get_shared_session():
+    global _shared_session
+    if _shared_session is None:
+        import aiohttp
+        _shared_session = aiohttp.ClientSession()
+    return _shared_session
+
+
 async def generate_speech_stream(text: str):
     """Generate TTS and yield base64 WAV chunks as they arrive."""
-    import aiohttp
     import os
     import re
     import asyncio
@@ -106,7 +115,6 @@ async def generate_speech_stream(text: str):
     chunks = []
     for sentence in sentences:
         if len(sentence) > 200:
-            # Further split
             words = sentence.split()
             for i in range(0, len(words), 30):
                 chunks.append(" ".join(words[i:i+30]))
@@ -117,7 +125,9 @@ async def generate_speech_stream(text: str):
     if not chunks and text.strip():
         chunks = [text.strip()]
 
-    # Send requests in parallel
+    session = await _get_shared_session()
+    headers = {"api-subscription-key": api_key}
+
     async def fetch_chunk(chunk_text):
         payload = {
             "inputs": [chunk_text],
@@ -128,20 +138,17 @@ async def generate_speech_stream(text: str):
             "model": "bulbul:v3"
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers={"api-subscription-key": api_key}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if "audios" in data and data["audios"]:
-                            return data["audios"][0]  # base64 WAV
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "audios" in data and data["audios"]:
+                        return data["audios"][0]
         except Exception as e:
             print(f"TTS Streaming Error: {e}")
         return None
 
-    # Start all requests concurrently
     tasks = [asyncio.create_task(fetch_chunk(chunk)) for chunk in chunks]
     
-    # Yield in order to maintain sentence sequence
     for task in tasks:
         result = await task
         if result:

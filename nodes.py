@@ -3,15 +3,15 @@ from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from agent_state import GraphState
 import os
-from langchain_cerebras import ChatCerebras
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
 from file_workflow import search_qdrant
 from langchain_groq import ChatGroq
 load_dotenv(override=True)
-CEREBRAS_API_KEY=os.getenv("CEREBRAS_API_KEY")
-client = ChatCerebras(model="gpt-oss-120b", api_key=CEREBRAS_API_KEY)
+NVDIA_API_KEY=os.getenv("NVDIA_API_KEY")
+client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
 from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
@@ -38,8 +38,8 @@ def save_user_memory(fact: str) -> str:
 
 
 def general_generation_node(State: GraphState):
-    CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-    client = ChatCerebras(model="gpt-oss-120b", api_key=CEREBRAS_API_KEY)
+    NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
+    client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
 
     tools = [get_weather, get_current_location, save_user_memory]
     llm_with_tools = client.bind_tools(tools)
@@ -62,11 +62,8 @@ def general_generation_node(State: GraphState):
     2. If the user asks for the weather "here", "my location", or does not specify a city, you MUST first call the `get_current_location` tool to find their city, and THEN call the `get_weather` tool with that city. Do NOT ask the user for their location!
     3. When calling a tool, do NOT output anything else. Just call the tool.
     
-    If and ONLY if you have successfully fetched the weather data, respond ONLY with the raw A2UI JSON object. DO NOT include any markdown formatting, backticks, conversational text, or explanations.
-    CRITICAL: If you encounter an error fetching the weather, DO NOT output JSON. Respond in normal conversational text!
-    You have access to the following component in the frontend catalog:
-    - "WeatherCard": Requires props: {{"city": "str", "temperature": "num", "condition": "str"}}
-    Example weather output:
+    [WEATHER OUTPUT FORMAT]
+    If and ONLY if you have successfully fetched the weather data, respond ONLY with the raw A2UI JSON object. 
     {{
     "type": "WeatherCard",
     "props": {{
@@ -75,7 +72,9 @@ def general_generation_node(State: GraphState):
         "condition": "haze"
     }}
     }}
-    You have two tools get_weather and get_current_location : you are free to use those tools incase necessary.
+    
+    FINAL CRITICAL INSTRUCTION:
+    For ALL OTHER normal questions and conversations (such as answering "what is my name", general chat, or if the weather tool fails), you MUST reply in normal, conversational PLAIN TEXT. DO NOT output JSON unless you are specifically generating the WeatherCard.
     """
     messages = [SystemMessage(content=system_prompt)] + State["messages"]
     
@@ -298,5 +297,5 @@ def generate_node(state:GraphState):
         response = client.invoke(messages)
         return {"answer": response.content, "messages":[response]}
     except Exception as e:
-        print(f"Cerebras API Error: {e}")
+        print(f"NVIDIA API Error: {e}")
         return {"answer": "The AI service is currently experiencing high traffic (Queue Exceeded). Please wait a few moments and try your question again!"}

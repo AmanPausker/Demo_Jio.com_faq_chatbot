@@ -216,6 +216,16 @@ function App() {
       const source = audioContext.createMediaStreamSource(audioStream);
       const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
 
+      const encodePCM = (pcmData) => {
+        const bytes = new Uint8Array(pcmData.buffer);
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      };
+
       processorNode.onaudioprocess = (event) => {
         if (socket.readyState !== WebSocket.OPEN) return;
         const input = event.inputBuffer.getChannelData(0);
@@ -224,33 +234,66 @@ function App() {
           pcmData[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
         }
         
-        const buffer = new ArrayBuffer(pcmData.buffer.byteLength);
-        const view = new Uint8Array(buffer);
-        view.set(new Uint8Array(pcmData.buffer));
-        let binary = '';
-        const bytes = new Uint8Array(buffer);
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        const chunk = window.btoa(binary);
-
-        socket.send(JSON.stringify({ type: "audio_chunk", payload: chunk }));
+        socket.send(JSON.stringify({ type: "audio_chunk", payload: encodePCM(pcmData) }));
       };
       source.connect(processorNode);
       processorNode.connect(audioContext.destination);
 
-      frameIntervalRef.current = setInterval(() => {
+      const captureFrame = async () => {
         if (!videoRef.current || socket.readyState !== WebSocket.OPEN) return;
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        canvas.width = 640;
-        canvas.height = 360;
-        canvas.getContext('2d').drawImage(videoRef.current, 0, 0, 640, 360);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
-        const jpeg = dataUrl.split(',')[1];
-        socket.send(JSON.stringify({ type: "video_frame", payload: jpeg }));
-      }, 1000);
+        try {
+          const track = videoRef.current.srcObject?.getVideoTracks()[0];
+          if (track && 'ImageCapture' in window) {
+            const capture = new ImageCapture(track);
+            const bitmap = await capture.grabFrame();
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            canvas.width = 640;
+            canvas.height = 360;
+            const ctx = canvas.getContext('bitmaprenderer') || canvas.getContext('2d');
+            if (typeof ctx.transferFromImageBitmap === 'function') {
+              ctx.transferFromImageBitmap(bitmap);
+            } else {
+              ctx.drawImage(bitmap, 0, 0, 640, 360);
+              bitmap.close();
+            }
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.6));
+            if (!blob) return;
+            const buffer = await blob.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const chunkSize = 16384;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+            }
+            socket.send(JSON.stringify({ type: "video_frame", payload: btoa(binary) }));
+          } else {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            canvas.width = 640;
+            canvas.height = 360;
+            canvas.getContext('2d').drawImage(videoRef.current, 0, 0, 640, 360);
+            canvas.toBlob((blob) => {
+              if (!blob) return;
+              const reader = new FileReader();
+              reader.onload = () => {
+                const jpeg = reader.result.split(',')[1];
+                socket.send(JSON.stringify({ type: "video_frame", payload: jpeg }));
+              };
+              reader.readAsDataURL(blob);
+            }, 'image/jpeg', 0.6);
+          }
+        } catch (err) {
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          canvas.width = 640;
+          canvas.height = 360;
+          canvas.getContext('2d').drawImage(videoRef.current, 0, 0, 640, 360);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+          socket.send(JSON.stringify({ type: "video_frame", payload: dataUrl.split(',')[1] }));
+        }
+      };
+      frameIntervalRef.current = setInterval(captureFrame, 1000);
 
       setLiveMode(true);
       setMode('live');
