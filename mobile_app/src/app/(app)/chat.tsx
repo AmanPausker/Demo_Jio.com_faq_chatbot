@@ -484,7 +484,7 @@ export default function ChatScreen() {
   };
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <LinearGradient colors={['#09090b', '#1e1b4b', '#09090b']} style={[styles.container, { paddingTop: insets.top }]}>
       <KeyboardAvoidingView 
         style={{ flex: 1 }} 
         behavior="padding"
@@ -494,7 +494,10 @@ export default function ChatScreen() {
             <TouchableOpacity onPress={() => navigation.dispatch(DrawerActions.openDrawer())}>
               <Feather name="menu" size={24} color="#fff" />
             </TouchableOpacity>
-            <Text style={styles.headerTitle}>Jio FAQ Chatbot</Text>
+            <View style={{flexDirection: 'row', alignItems: 'center', gap: 8}}>
+              <MaterialIcons name="auto-awesome" size={20} color="#a855f7" />
+              <Text style={styles.headerTitle}>Assistant</Text>
+            </View>
             <TouchableOpacity onPress={() => supabase.auth.signOut()}>
               <Text style={styles.logoutText}>Logout</Text>
             </TouchableOpacity>
@@ -605,25 +608,25 @@ export default function ChatScreen() {
         </>
       )}
       </KeyboardAvoidingView>
-    </View>
+    </LinearGradient>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#09090b',
+    backgroundColor: 'transparent',
   },
   header: {
     paddingTop: 15,
     paddingBottom: 15,
     paddingHorizontal: 20,
-    backgroundColor: '#18181b',
+    backgroundColor: 'rgba(24, 24, 27, 0.4)',
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     borderBottomWidth: 1,
-    borderBottomColor: '#27272a',
+    borderBottomColor: 'rgba(39, 39, 42, 0.3)',
   },
   headerTitle: {
     color: '#fff',
@@ -674,7 +677,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     padding: 12,
     paddingBottom: Platform.OS === 'ios' ? 24 : 12,
-    backgroundColor: '#18181b',
+    backgroundColor: 'rgba(24, 24, 27, 0.6)',
     alignItems: 'center',
   },
   input: {

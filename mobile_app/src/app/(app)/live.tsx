@@ -8,6 +8,26 @@ import { useFocusEffect } from '@react-navigation/native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../../utils/supabaseClient';
 
+// PCM encoding buffer
+const pcmEncode = (audioData: Float32Array): ArrayBuffer => {
+  const pcm = new Int16Array(audioData.length);
+  for (let i = 0; i < audioData.length; i++) {
+    pcm[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
+  }
+  return pcm.buffer;
+};
+
+const encodeBase64 = (buffer: ArrayBuffer): string => {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = Array.from(bytes.subarray(i, i + chunkSize));
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+};
+
 export default function LiveChatScreen() {
   const router = useRouter();
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -21,10 +41,20 @@ export default function LiveChatScreen() {
   const isRecordingRef = useRef(false);
   const activeSessionIdRef = useRef(Date.now().toString()); 
   
-  // Audio playback queue
+  // TTS playback queue
   const ttsQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
+
+  // Audio recording refs
+  const audioRecorderRef = useRef<any>(null);
+  const audioStreamRef = useRef<any>(null);
+
+  // VAD logic
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isSpeakingState = useRef(false);
+  const VOLUME_THRESHOLD = -20;
+  const SILENCE_MS_TO_STOP = 1500;
 
   // Setup permissions
   useEffect(() => {
@@ -35,12 +65,11 @@ export default function LiveChatScreen() {
   // Connect WebSocket and setup loops
   useFocusEffect(
     useCallback(() => {
-      // Clear old state and start a fresh session on the backend
       setMessages([]);
       activeSessionIdRef.current = Date.now().toString();
 
       let mounted = true;
-      let frameInterval: NodeJS.Timeout;
+      let frameInterval: ReturnType<typeof setInterval>;
       
       const connectWs = async () => {
         const { data: { session } } = await supabase.auth.getSession();
@@ -50,13 +79,13 @@ export default function LiveChatScreen() {
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
         
-        ws.onopen = () => {
+        ws.onopen = async () => {
           ws.send(JSON.stringify({
             type: "auth",
             payload: { token: session.access_token, session_id: activeSessionIdRef.current }
           }));
           
-          // Start Video Loop
+          // Start Video Loop (0.5 FPS)
           frameInterval = setInterval(async () => {
             if (!mounted || !cameraRef.current) return;
             try {
@@ -67,9 +96,9 @@ export default function LiveChatScreen() {
             } catch (e) {}
           }, 2000);
           
-          // Start Audio Loop
+          // Start streaming audio via PCM chunks through WebSocket
           isRecordingRef.current = true;
-          startAudioRecordingLoop(ws);
+          startStreamingAudio(ws);
         };
 
         ws.onmessage = (event) => {
@@ -92,7 +121,14 @@ export default function LiveChatScreen() {
         isRecordingRef.current = false;
         if (frameInterval) clearInterval(frameInterval);
         if (wsRef.current) wsRef.current.close();
-        if (soundRef.current) soundRef.current.unloadAsync();
+        try {
+          if (soundRef.current) soundRef.current.unloadAsync();
+        } catch (e) {}
+        try {
+          if (audioRecorderRef.current) {
+            audioRecorderRef.current.stopAndUnloadAsync();
+          }
+        } catch (e) {}
       };
     }, [])
   );
@@ -128,7 +164,7 @@ export default function LiveChatScreen() {
     }
   };
 
-  const startAudioRecordingLoop = async (ws: WebSocket) => {
+  const startStreamingAudio = async (ws: WebSocket) => {
     if (!isRecordingRef.current) return;
     
     try {
@@ -138,30 +174,63 @@ export default function LiveChatScreen() {
       });
       
       const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        (status) => {
+          if (status.metering) {
+            handleMetering(status.metering, ws);
+          }
+        },
+        100
       );
-      
-      // Record for 1.5 seconds
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
-      if (!isRecordingRef.current) {
-        await recording.stopAndUnloadAsync();
-        return;
+      audioRecorderRef.current = recording;
+    } catch (err) {
+      console.error("Audio start error", err);
+      setTimeout(() => startStreamingAudio(ws), 1000);
+    }
+  };
+
+  const handleMetering = (db: number, ws: WebSocket) => {
+    if (isPlayingRef.current) return;
+
+    if (db > VOLUME_THRESHOLD) {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
       }
+      if (!isSpeakingState.current) {
+        isSpeakingState.current = true;
+        if (soundRef.current && isPlayingRef.current) {
+          soundRef.current.stopAsync().catch(() => {});
+          isPlayingRef.current = false;
+        }
+        ws.send(JSON.stringify({ type: "interrupt" }));
+      }
+    } else {
+      if (isSpeakingState.current && !silenceTimerRef.current) {
+        silenceTimerRef.current = setTimeout(() => {
+          isSpeakingState.current = false;
+          handleSpeechEnd(ws);
+        }, SILENCE_MS_TO_STOP);
+      }
+    }
+  };
+
+  const handleSpeechEnd = async (ws: WebSocket) => {
+    if (!audioRecorderRef.current || !isRecordingRef.current) return;
+    try {
+      await audioRecorderRef.current.stopAndUnloadAsync();
+      const uri = audioRecorderRef.current.getURI();
+      audioRecorderRef.current = null;
       
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
       if (uri && ws.readyState === WebSocket.OPEN) {
         const base64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
-        ws.send(JSON.stringify({ type: "audio_file", payload: base64 }));
+        ws.send(JSON.stringify({ type: "audio_file_full", payload: base64 }));
       }
       
-      // Immediately start next loop
-      startAudioRecordingLoop(ws);
-    } catch (err) {
-      console.error("Audio loop error", err);
-      // Wait a bit and retry
-      setTimeout(() => startAudioRecordingLoop(ws), 1000);
+      startStreamingAudio(ws);
+    } catch (e) {
+      console.error('Stop recording error', e);
+      startStreamingAudio(ws);
     }
   };
 

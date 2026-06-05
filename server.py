@@ -323,18 +323,15 @@ async def upload_document(background_tasks : BackgroundTasks, file: UploadFile =
     except Exception as e:
         return {"error": f"Failed to process file: {str(e)}"}
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 CLOUDFARE_ID = os.getenv("CLOUDFARE_ACCOUNT_ID")
 WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 
-from langchain_openai import ChatOpenAI
-OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
+NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
 
-kimi_vision_llm = ChatOpenAI(
-    api_key=OPEN_ROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    model="nvidia/nemotron-nano-12b-v2-vl:free",
+kimi_vision_llm = ChatNVIDIA(
+    model="meta/llama-3.2-11b-vision-instruct",
+    nvidia_api_key=NVDIA_API_KEY,
     max_tokens=1000
 )
 @server.post("/api/vision")
@@ -346,16 +343,17 @@ async def analyze_image(image: UploadFile=File(...)):
         mime_type = image.content_type or "image/jpeg"
         message = HumanMessage(
                 content=[
-                    {"type": "text", "text": "You are a helpful Assistant. Describe this image in detail and tell the user."},
+                    {"type": "text", "text": "Describe this image concisely."},
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}"
+                            "url": f"data:{mime_type};base64,{base64_image}",
+                            "detail": "low"
                         },
                     },
                 ]
             )
-        response = kimi_vision_llm.invoke([message])
+        response = await kimi_vision_llm.ainvoke([message])
         return {"success":True, "text":response.content}
     except Exception as e:
         return {"error":str(e)}
@@ -391,14 +389,14 @@ from collections import deque
 import hashlib
 import time
 
-from langchain_cerebras import ChatCerebras
-cerebras_llm = ChatCerebras(model="llama3.1-70b", api_key=os.getenv("CEREBRAS_API_KEY"))
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+primary_llm = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=os.getenv("NVDIA_API_KEY"))
 
 class Session:
     def __init__(self, session_id: str, user_id: str):
         self.session_id = session_id
         self.user_id = user_id
-        self.frame_buffer: deque = deque(maxlen=10)
+        self.frame_buffer: deque = deque(maxlen=5)
         self.conversation_history: list = []
         self.world_state: dict = {
             "objects": {},
@@ -406,199 +404,212 @@ class Session:
             "text_seen": {},
             "recent_events": []
         }
-        self.last_frame_hash: str = ""
+        self.last_region_hashes: tuple = (None, None, None)
         self.is_processing: bool = False
+        self.last_activity_time: float = time.time()
         
         # Audio buffering
         self.audio_buffer = bytearray()
         self.vad_iterator = None
+        
+        # Unified background vision cache (replaces pre_analyze + periodic_summary)
+        self.cached_visual_desc: str = ""
+        self.cached_visual_time: float = 0
+        self.cached_visual_hashes: tuple = (None, None, None)
+        self.is_analyzing_vision: bool = False
+        self.last_analysis_time: float = 0
+
+    def touch(self):
+        self.last_activity_time = time.time()
 
 class ConnectionManager:
     def __init__(self):
         self.sessions: dict[str, Session] = {}
+        self._cleanup_task = None
 
     def get_session(self, session_id: str, user_id: str) -> Session:
         if session_id not in self.sessions:
             self.sessions[session_id] = Session(session_id, user_id)
+        self.sessions[session_id].touch()
         return self.sessions[session_id]
+
+    def start_cleanup(self, ttl_seconds: int = 600):
+        async def _cleanup():
+            while True:
+                await asyncio.sleep(120)
+                now = time.time()
+                stale = [sid for sid, s in self.sessions.items()
+                         if now - s.last_activity_time > ttl_seconds]
+                for sid in stale:
+                    del self.sessions[sid]
+                if stale:
+                    print(f"[Cleanup] Removed {len(stale)} stale sessions")
+        self._cleanup_task = asyncio.create_task(_cleanup())
 
 manager = ConnectionManager()
 
-def scene_changed(frame_b64: str, last_hash: str, threshold: int = 5000) -> tuple[bool, str]:
-    current_hash = hashlib.md5(frame_b64[:threshold].encode()).hexdigest()
-    changed = current_hash != last_hash
-    return changed, current_hash
+MIN_ANALYSIS_INTERVAL = 3.0
 
-async def periodic_visual_summary(session: Session, websocket: WebSocket):
-    while True:
-        await asyncio.sleep(5)
-        if not session.frame_buffer or session.is_processing:
-            continue
-            
-        latest_frame = session.frame_buffer[-1]
-        changed, current_hash = scene_changed(latest_frame, session.last_frame_hash)
-        
-        if changed:
-            session.last_frame_hash = current_hash
-            current_state_str = json.dumps(session.world_state, indent=2)
-            prompt_text = f"""You are a realtime world model analyzer.
-Look at this image. The current world state is:
-{current_state_str}
+# Pre-cache shared aiohttp session for TTS
+_tts_session = None
+async def get_tts_session():
+    global _tts_session
+    if _tts_session is None:
+        import aiohttp
+        _tts_session = aiohttp.ClientSession()
+    return _tts_session
 
-Identify any changes (objects moved, new people, actions occurring).
-Output ONLY valid JSON containing any state updates and new events.
-Format:
-{{
-  "objects": {{ "item_name": {{"location": "new location", "last_seen": "timestamp/now"}} }},
-  "people": {{ "person_name": {{"action": "what they are doing"}} }},
-  "text_seen": {{ "snippet": "text content" }},
-  "new_events": ["user picked up mug", "person entered room"]
-}}
-Return ONLY the JSON object, without markdown blocks."""
-            message = HumanMessage(content=[
-                {
-                    "type": "text",
-                    "text": prompt_text
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{latest_frame}",
-                        "detail": "low"
-                    }
-                }
-            ])
-            try:
-                response = await kimi_vision_llm.ainvoke([message])
-                json_str = response.content.strip()
-                import re
-                json_str = re.sub(r"```json", "", json_str)
-                json_str = re.sub(r"```", "", json_str).strip()
-                parsed = json.loads(json_str)
-                
-                if "objects" in parsed: session.world_state["objects"].update(parsed["objects"])
-                if "people" in parsed: session.world_state["people"].update(parsed["people"])
-                if "text_seen" in parsed: session.world_state["text_seen"].update(parsed["text_seen"])
-                if "new_events" in parsed and isinstance(parsed["new_events"], list):
-                    session.world_state["recent_events"].extend(parsed["new_events"])
-                    # Keep only last 20 events to prevent bloat
-                    session.world_state["recent_events"] = session.world_state["recent_events"][-20:]
-                
-                await websocket.send_json({
-                    "type": "visual_summary",
-                    "payload": "World state updated."
-                })
-            except Exception as e:
-                print(f"World model update failed: {e}")
+def scene_changed(frame_b64: str, last_hashes: tuple[int, str],
+                  sample_size: int = 5000) -> tuple[bool, tuple]:
+    """Detect scene changes using multi-region hashing.
+    Divides frame into 3 regions (top, mid, bottom). A scene change requires
+    at least 2 of 3 regions to change, ignoring minor localized movement."""
+    total = len(frame_b64)
+    if total < 100:
+        return False, last_hashes
+    region = min(sample_size, total // 3)
+    h1 = hashlib.md5(frame_b64[:region].encode()).hexdigest()
+    mid_start = max(0, total // 2 - region // 2)
+    h2 = hashlib.md5(frame_b64[mid_start:mid_start + region].encode()).hexdigest()
+    h3 = hashlib.md5(frame_b64[-region:].encode()).hexdigest()
+    new_hashes = (h1, h2, h3)
+    if last_hashes[0] is None:
+        return False, new_hashes
+    changes = sum(1 for a, b in zip(new_hashes, last_hashes) if a != b)
+    return changes >= 2, new_hashes
+
+
 
 def needs_visual_context(question: str) -> bool:
+    q = question.lower().strip()
+
+    negative_patterns = [
+        "what is your", "what is the capital", "what is the meaning",
+        "what is the difference", "tell me about yourself",
+        "what are you", "who are you", "what can you", "how are you",
+        "what time", "what date", "what day", "what's your name"
+    ]
+    for pat in negative_patterns:
+        if pat in q:
+            return False
+
     visual_keywords = [
         "what is", "what's", "what are", "what does",
-        "what do", "can you see", "look at", "this",
-        "that", "these", "those", "read", "tell me about",
-        "describe", "what color", "how many", "what kind",
-        "what type", "is there", "are there", "do you see",
-        "what does it", "what does this", "what's that",
-        "who is", "whose"
+        "what do", "can you see", "look at",
+        "read", "tell me about", "describe",
+        "what color", "how many", "what kind", "what type",
+        "is there", "are there", "do you see",
+        "who is", "whose",
+        "how does this", "does this look", "show me",
+        "can you read", "translate", "identify",
+        "recognize", "see this", "looks like",
+        "what's happening", "what is happening", "what's on"
     ]
-    q = question.lower().strip()
-    return any(keyword in q for keyword in visual_keywords)
+
+    short_trigger_words = ["this", "that", "these", "those"]
+    if q in short_trigger_words or (len(q.split()) <= 3 and any(w in q.split() for w in short_trigger_words)):
+        return True
+
+    for keyword in visual_keywords:
+        if keyword in q:
+            return True
+    return False
 
 def build_live_prompt(session: Session, question: str) -> str:
-    parts = []
-    parts.append(
+    parts = [
         "You are a live visual assistant. You can see through the user's camera. "
         "Answer naturally and conversationally. Be concise."
-    )
-    
-    world_state_str = json.dumps(session.world_state, indent=2)
-    parts.append(f"Current World Model:\n{world_state_str}")
+    ]
 
-    recent = session.conversation_history[-8:]
-    if recent:
-        parts.append("Recent conversation:")
-        for msg in recent:
-            prefix = "User" if msg["role"] == "user" else "Assistant"
-            parts.append(f"{prefix}: {msg['content']}")
 
-    parts.append(f"Current question: {question}")
-    return "\n\n".join(parts)
+    parts.append(f"Q: {question}")
+    return "\n".join(parts)
+
+
+
+
+async def _send_tts_filler(websocket: WebSocket, text: str):
+    """Send a short TTS filler to mask vision LLM latency."""
+    from get_audio import generate_speech_stream
+    try:
+        async for chunk in generate_speech_stream(text):
+            await websocket.send_json({"type": "tts_chunk", "payload": chunk})
+    except Exception:
+        pass
+
+_FILLER_PHRASES = ["Let me look...", "Let me see...", "One moment...", "Looking..."]
 
 async def handle_user_question(session: Session, question: str, websocket: WebSocket):
     session.is_processing = True
     session.conversation_history.append({"role": "user", "content": question})
 
     needs_vision = needs_visual_context(question)
-    prompt = build_live_prompt(session, question)
+    prompt_text = build_live_prompt(session, question)
 
     try:
         if needs_vision and session.frame_buffer:
             latest_frame = session.frame_buffer[-1]
-            vision_msg = HumanMessage(content=[
-                {"type": "text", "text": f"The user is asking: '{question}'. Answer based on what you see in the image. Be specific and concise."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{latest_frame}", "detail": "high"}}
-            ])
+            import random
+            asyncio.create_task(_send_tts_filler(
+                websocket, random.choice(_FILLER_PHRASES)))
+            vision_content = [
+                {"type": "text", "text": f"The user asks: '{question}'. Describe what you see in the image to answer the question. Be concise and factual. Do not make things up."}
+            ]
+            vision_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{latest_frame}", "detail": "low"}})
+            vision_msg = HumanMessage(content=vision_content)
             try:
                 vis_resp = await kimi_vision_llm.ainvoke([vision_msg])
                 visual_desc = vis_resp.content.strip()
             except Exception as e:
                 visual_desc = f"[Vision unavailable: {e}]"
-                
-            final_prompt = f"{prompt}\n\nVisual analysis of camera feed:\n{visual_desc}\n\nAnswer the user's question naturally based on what you see."
+
+            final_prompt = (
+                f"{prompt_text}\n\nVisual analysis of camera feed:\n{visual_desc}\n"
+                "Answer the user's question naturally based on what you see."
+            )
             messages = [
                 {"role": "system", "content": "You are a helpful live visual assistant. Answer concisely."},
                 {"role": "user", "content": final_prompt}
             ]
         else:
-            messages = [
-                {"role": "system", "content": prompt},
-            ]
+            messages = [{"role": "system", "content": prompt_text}]
             for msg in session.conversation_history[-6:]:
                 role = "user" if msg["role"] == "user" else "assistant"
                 messages.append({"role": role, "content": msg["content"]})
-                
+
         try:
-            response = await cerebras_llm.ainvoke(messages)
+            response = await primary_llm.ainvoke(messages)
             answer = response.content
-        except Exception:
-            groq = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"))
-            response = await groq.ainvoke(messages)
-            answer = response.content
+        except Exception as e:
+            print(f"Primary LLM failed: {e}")
+            answer = "I'm having trouble thinking right now. Please try again."
 
         session.conversation_history.append({"role": "assistant", "content": answer})
 
         try:
-            await websocket.send_json({
-                "type": "assistant_response",
-                "payload": answer
-            })
-
+            await websocket.send_json({"type": "assistant_response", "payload": answer})
             from get_audio import generate_speech_stream
             async for audio_chunk_b64 in generate_speech_stream(answer):
-                await websocket.send_json({
-                    "type": "tts_chunk",
-                    "payload": audio_chunk_b64
-                })
+                await websocket.send_json({"type": "tts_chunk", "payload": audio_chunk_b64})
         except Exception as ws_err:
-            print(f"WebSocket closed during response transmission: {ws_err}")
-            
+            print(f"WebSocket closed: {ws_err}")
+
     except Exception as e:
         print(f"Error handling question: {e}")
         try:
             await websocket.send_json({"type": "error", "payload": "Failed to generate response"})
         except Exception:
             pass
-        
+
     session.is_processing = False
 
 import torch
 import numpy as np
-from get_transcript import transcribe_audio_file, _vad_model, VADIterator, SAMPLE_RATE, VAD_WINDOW
+from get_transcript import transcribe_pcm, _vad_model, VADIterator, SAMPLE_RATE, VAD_WINDOW
 
 async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket: WebSocket):
     pcm_bytes = base64.b64decode(audio_chunk_b64)
     session.audio_buffer.extend(pcm_bytes)
-    print(f"[VAD] Received {len(pcm_bytes)} PCM bytes, buffer total: {len(session.audio_buffer)}")
     
     if session.vad_iterator is None:
         session.vad_iterator = VADIterator(
@@ -616,38 +627,20 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
     session.vad_sample_buffer.extend(samples)
     
     speech_ended = False
-    vad_start_detected = False
     while len(session.vad_sample_buffer) >= VAD_WINDOW:
         window = torch.tensor(session.vad_sample_buffer[:VAD_WINDOW], dtype=torch.float32)
         session.vad_sample_buffer = session.vad_sample_buffer[VAD_WINDOW:]
         result = session.vad_iterator(window)
         if result:
-            print(f"[VAD] Event detected: {result}")
-            if "start" in result:
-                vad_start_detected = True
             if "end" in result:
                 speech_ended = True
-    print(f"[VAD] speech_ended={speech_ended}, remaining_vad_buffer={len(session.vad_sample_buffer)}")
             
     if speech_ended:
         audio_data = bytes(session.audio_buffer)
         session.audio_buffer = bytearray()
         
-        import tempfile
-        import wave
-        
-        fd, temp_wav = tempfile.mkstemp(suffix=".wav")
-        with os.fdopen(fd, 'wb') as f:
-            with wave.open(f, 'wb') as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(audio_data)
-                
         try:
-            with open(temp_wav, "rb") as f:
-                wav_bytes = f.read()
-            transcript = await transcribe_audio_file(wav_bytes)
+            transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
             if transcript and transcript.strip():
                 import re
                 transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
@@ -655,9 +648,6 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
                 asyncio.create_task(handle_user_question(session, transcript, websocket))
         except Exception as e:
             print(f"STT Error in live chunk: {e}")
-        finally:
-            if os.path.exists(temp_wav):
-                os.remove(temp_wav)
 
 @server.websocket("/api/live/ws")
 async def live_chat_websocket(websocket: WebSocket):
@@ -683,50 +673,48 @@ async def live_chat_websocket(websocket: WebSocket):
         print(f"[LIVE WS] Authenticated user: {user_id}, session: {session_id}")
         session = manager.get_session(session_id, user_id)
 
-        summary_task = asyncio.create_task(periodic_visual_summary(session, websocket))
-
         try:
-            print("[LIVE WS] Entering message loop")
             while True:
                 data = await websocket.receive_json()
                 event_type = data.get("type")
                 payload = data.get("payload")
-                if event_type != "video_frame":
-                    print(f"[LIVE WS] Received event: {event_type}, payload size: {len(str(payload)[:100])}")
 
                 if event_type == "audio_chunk":
-                    print(f"[LIVE WS] Processing audio_chunk, size: {len(payload)}")
                     await process_audio_chunk(session, payload, websocket)
 
                 elif event_type == "audio_file":
                     try:
-                        import tempfile
                         import subprocess
-                        import os
                         file_bytes = base64.b64decode(payload)
-                        fd_in, temp_in = tempfile.mkstemp(suffix=".tmp")
-                        fd_out, temp_out = tempfile.mkstemp(suffix=".wav")
-                        with os.fdopen(fd_in, 'wb') as f:
-                            f.write(file_bytes)
-                            
-                        # Use ffmpeg to extract 16kHz raw PCM
-                        print(f"[LIVE WS] Running ffmpeg on {len(file_bytes)} bytes")
-                        result = subprocess.run(["ffmpeg", "-y", "-i", temp_in, "-f", "s16le", "-ac", "1", "-ar", "16000", temp_out], check=True, capture_output=True)
-                        with open(temp_out, "rb") as f:
-                            pcm_data = f.read()
-                        print(f"[LIVE WS] ffmpeg produced {len(pcm_data)} bytes of PCM")
-                            
-                        # Feed the decoded PCM to process_audio_chunk by encoding to base64
+                        proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le",
+                            "-ac", "1", "-ar", "16000", "pipe:1",
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
+                        pcm_data, stderr = await proc.communicate(file_bytes)
+                        if proc.returncode != 0:
+                            print(f"ffmpeg error: {stderr.decode()[:200]}")
+                            continue
                         b64_pcm = base64.b64encode(pcm_data).decode('utf-8')
                         await process_audio_chunk(session, b64_pcm, websocket)
                     except Exception as e:
                         print(f"Error decoding audio_file: {e}")
-                    finally:
-                        if os.path.exists(temp_in): os.remove(temp_in)
-                        if os.path.exists(temp_out): os.remove(temp_out)
+
+                elif event_type == "audio_file_full":
+                    try:
+                        file_bytes = base64.b64decode(payload)
+                        transcript = await transcribe_audio_file(file_bytes)
+                        if transcript and transcript.strip():
+                            import re
+                            transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
+                            await websocket.send_json({"type": "transcript", "payload": transcript})
+                            asyncio.create_task(handle_user_question(session, transcript, websocket))
+                    except Exception as e:
+                        print(f"Error processing audio_file_full: {e}")
 
                 elif event_type == "video_frame":
                     session.frame_buffer.append(payload)
+                    session.touch()
 
                 elif event_type == "transcript":
                     await handle_user_question(session, payload, websocket)
@@ -736,8 +724,7 @@ async def live_chat_websocket(websocket: WebSocket):
                     await websocket.send_json({"type": "interrupt_ack"})
 
         except WebSocketDisconnect:
-            if summary_task:
-                summary_task.cancel()
+            pass
     except Exception as e:
         print(f"Live WS Error: {e}")
         try:
@@ -745,8 +732,11 @@ async def live_chat_websocket(websocket: WebSocket):
         except:
             pass
 
-if __name__ == "__main__":
+@server.on_event("startup")
+async def startup():
+    manager.start_cleanup(ttl_seconds=600)
 
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=False)
 
