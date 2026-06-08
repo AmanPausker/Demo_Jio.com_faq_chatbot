@@ -83,6 +83,18 @@ async def test_memory(user_id: str = Depends(get_current_user), token: str = Dep
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@server.get("/api/memory")
+async def get_memory(user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    try:
+        user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+        res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+        long_term_memory = ""
+        if res.data and res.data[0].get("facts"):
+            long_term_memory = "\n".join(res.data[0]["facts"])
+        return {"memory": long_term_memory, "user_id": user_id}
+    except Exception as e:
+        return {"memory": "", "error": str(e), "user_id": user_id}
+
 def process_a2ui_messages(answer: str):
     a2ui_msgs = []
     surface_id = f"chat_{uuid.uuid4().hex[:8]}"
@@ -115,18 +127,14 @@ def process_a2ui_messages(answer: str):
                         "updateComponents": {
                             "surfaceId": surface_id,
                             "components": [
-                                { "id": "root", "component": "WeatherCard", **props }
+                                { "id": "root", "component": "WeatherCard", "props": props }
                             ]
                         }
                     }
                 ]
             else:
-                if "message" in parsed:
-                    new_answer = parsed["message"]
-                    spoken_text = parsed["message"]
-                elif "text" in parsed:
-                    new_answer = parsed["text"]
-                    spoken_text = parsed["text"]
+                # Not a WeatherCard — ignore the JSON, keep original answer as plain text
+                pass
         except Exception as e:
             print(f"JSON Parse Error: {e}")
             
@@ -224,12 +232,40 @@ async def get_session_history(session_id: str, user_id: str = Depends(get_curren
     messages = []
     if state and hasattr(state, "values") and "messages" in state.values:
         for msg in state.values["messages"]:
+            content = msg.content
+            a2ui_msgs = []
+            
+            # If AI message, check if it contains A2UI JSON
+            if msg.type != "human":
+                from server import process_a2ui_messages
+                new_text, _, parsed_a2ui, _ = process_a2ui_messages(content)
+                if parsed_a2ui:
+                    content = new_text
+                    a2ui_msgs = parsed_a2ui
+                    
             messages.append({
                 "type": "user" if msg.type == "human" else "ai",
-                "content": msg.content
+                "content": content,
+                "a2ui_messages": a2ui_msgs
             })
             
     return {"history": messages}
+
+@server.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    try:
+        # Verify ownership
+        res = user_supabase.table("chat_sessions").select("id").eq("id", session_id).eq("user_id", user_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=403, detail="Session not found or access denied")
+            
+        # Delete from Supabase
+        user_supabase.table("chat_sessions").delete().eq("id", session_id).execute()
+        
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @server.post("/api/chat/audio")
 async def chat_audio(audio: UploadFile = File(...), session_id: Optional[str] = Form(None), user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
@@ -323,16 +359,18 @@ async def upload_document(background_tasks : BackgroundTasks, file: UploadFile =
     except Exception as e:
         return {"error": f"Failed to process file: {str(e)}"}
 
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_openai import ChatOpenAI
 CLOUDFARE_ID = os.getenv("CLOUDFARE_ACCOUNT_ID")
 WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 
-NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
+OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 
-kimi_vision_llm = ChatNVIDIA(
-    model="meta/llama-3.2-11b-vision-instruct",
-    nvidia_api_key=NVDIA_API_KEY,
-    max_tokens=1000
+from langchain_openai import ChatOpenAI
+kimi_vision_llm = ChatOpenAI(
+    model="openai/gpt-4o-mini",
+    api_key=os.getenv("OPEN_ROUTER_API_KEY"),
+    base_url="https://openrouter.ai/api/v1",
+    max_tokens=250
 )
 @server.post("/api/vision")
 async def analyze_image(image: UploadFile=File(...)):
@@ -389,8 +427,9 @@ from collections import deque
 import hashlib
 import time
 
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-primary_llm = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=os.getenv("NVDIA_API_KEY"))
+from langchain_groq import ChatGroq
+# ChatGroq streams genuine tokens (sub-50ms TTFT) — ChatNVIDIA buffers internally
+primary_llm = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"), streaming=True)
 
 class Session:
     def __init__(self, session_id: str, user_id: str):
@@ -458,6 +497,31 @@ async def get_tts_session():
         import aiohttp
         _tts_session = aiohttp.ClientSession()
     return _tts_session
+
+async def fetch_tts_sentence(text: str) -> str | None:
+    """Fetch TTS for a single sentence and return base64 audio string or None."""
+    api_key = os.getenv("SARVAM_API_KEY")
+    url = "https://api.sarvam.ai/text-to-speech"
+    payload = {
+        "inputs": [text],
+        "target_language_code": "hi-IN",
+        "speaker": "shubh",
+        "model": "bulbul:v3"
+    }
+    headers = {"api-subscription-key": api_key}
+    try:
+        tts_sess = await get_tts_session()
+        async with tts_sess.post(url, json=payload, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if "audios" in data and data["audios"]:
+                    return data["audios"][0]
+            else:
+                err_text = await resp.text()
+                print(f"TTS API error {resp.status} for: '{text[:40]}' - Reason: {err_text}")
+    except Exception as e:
+        print(f"TTS sentence error: {e}")
+    return None
 
 def scene_changed(frame_b64: str, last_hashes: tuple[int, str],
                   sample_size: int = 5000) -> tuple[bool, tuple]:
@@ -540,6 +604,15 @@ async def _send_tts_filler(websocket: WebSocket, text: str):
 _FILLER_PHRASES = ["Let me look...", "Let me see...", "One moment...", "Looking..."]
 
 async def handle_user_question(session: Session, question: str, websocket: WebSocket):
+    """
+    Streaming LLM → Parallel TTS pipeline.
+    - LLM tokens stream in via astream()
+    - Sentence boundaries trigger async TTS fetch tasks immediately
+    - Producer/consumer queue delivers TTS chunks in order while LLM still streams
+    - Result: time-to-first-audio = LLM first sentence latency + TTS latency
+      (vs. previously: full LLM latency + TTS latency)
+    """
+    t_start = time.time()
     session.is_processing = True
     session.conversation_history.append({"role": "user", "content": question})
 
@@ -547,20 +620,41 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     prompt_text = build_live_prompt(session, question)
 
     try:
+        messages = []
+
         if needs_vision and session.frame_buffer:
             latest_frame = session.frame_buffer[-1]
+
+            # Compress image before sending
+            try:
+                from PIL import Image
+                import io
+                img_data = base64.b64decode(latest_frame)
+                img = Image.open(io.BytesIO(img_data))
+                img.thumbnail((512, 512))
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                out_io = io.BytesIO()
+                img.save(out_io, format='JPEG', quality=85)
+                latest_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
+            except Exception as resize_err:
+                print(f"Image resize error: {resize_err}")
+
             import random
             asyncio.create_task(_send_tts_filler(
                 websocket, random.choice(_FILLER_PHRASES)))
             vision_content = [
                 {"type": "text", "text": f"The user asks: '{question}'. Describe what you see in the image to answer the question. Be concise and factual. Do not make things up."}
             ]
-            vision_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{latest_frame}", "detail": "low"}})
+            vision_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{latest_frame}"}})
             vision_msg = HumanMessage(content=vision_content)
             try:
-                vis_resp = await kimi_vision_llm.ainvoke([vision_msg])
+                t_vision = time.time()
+                vis_resp = await asyncio.wait_for(kimi_vision_llm.ainvoke([vision_msg]), timeout=7.0)
                 visual_desc = vis_resp.content.strip()
+                print(f"[LATENCY] Vision LLM took {(time.time() - t_vision)*1000:.0f}ms")
             except Exception as e:
+                print(f"Vision error type: {type(e)}, error: {repr(e)}")
                 visual_desc = f"[Vision unavailable: {e}]"
 
             final_prompt = (
@@ -577,22 +671,92 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                 role = "user" if msg["role"] == "user" else "assistant"
                 messages.append({"role": role, "content": msg["content"]})
 
-        try:
-            response = await primary_llm.ainvoke(messages)
-            answer = response.content
-        except Exception as e:
-            print(f"Primary LLM failed: {e}")
-            answer = "I'm having trouble thinking right now. Please try again."
+        # ── Streaming LLM → Ordered Parallel TTS ──────────────────────────────
+        # Sentence boundaries that trigger a TTS request
+        SENTENCE_ENDINGS = {'.', '!', '?'}
+        # Avoid firing TTS for very short fragments (e.g. "Ok.")
+        MIN_SENTENCE_LEN = 12
 
+        full_answer = ""
+        tts_queue: asyncio.Queue = asyncio.Queue()
+
+        async def llm_producer():
+            """Stream LLM tokens, enqueue ordered TTS tasks on sentence boundaries."""
+            nonlocal full_answer
+            sentence_buffer = ""
+            t_llm = time.time()
+            first_token = True
+            try:
+                async for chunk in primary_llm.astream(messages):
+                    if not session.is_processing:
+                        print("[STREAM] LLM interrupted by barge-in.")
+                        break
+                    token = chunk.content
+                    if not token:
+                        continue
+                    full_answer += token
+                    sentence_buffer += token
+                    if first_token:
+                        print(f"[LATENCY] LLM first token: {(time.time() - t_llm)*1000:.0f}ms")
+                        first_token = False
+                    # Stream text to frontend for live display
+                    try:
+                        await websocket.send_json({"type": "text_chunk", "payload": token})
+                    except Exception:
+                        break
+                    # Fire TTS as soon as a sentence is complete
+                    stripped = sentence_buffer.strip()
+                    if stripped and stripped[-1] in SENTENCE_ENDINGS and len(stripped) >= MIN_SENTENCE_LEN:
+                        task = asyncio.create_task(fetch_tts_sentence(stripped))
+                        await tts_queue.put(task)
+                        sentence_buffer = ""
+                print(f"[LATENCY] LLM streaming done: {(time.time() - t_llm)*1000:.0f}ms | chars={len(full_answer)}")
+            except Exception as e:
+                print(f"[STREAM] LLM streaming error: {e}")
+            finally:
+                # Flush any remaining sentence that didn't end with punctuation
+                if sentence_buffer.strip() and session.is_processing:
+                    task = asyncio.create_task(fetch_tts_sentence(sentence_buffer.strip()))
+                    await tts_queue.put(task)
+                await tts_queue.put(None)  # Sentinel: signals consumer to stop
+
+        async def tts_consumer():
+            """Consume ordered TTS tasks and forward audio chunks to WebSocket."""
+            t_tts = time.time()
+            first_chunk = True
+            while True:
+                task = await tts_queue.get()
+                if task is None:
+                    break  # Sentinel received — all sentences processed
+                if not session.is_processing:
+                    task.cancel()
+                    continue
+                try:
+                    audio_b64 = await task
+                    if audio_b64:
+                        if first_chunk:
+                            print(f"[LATENCY] TTS first chunk: {(time.time() - t_tts)*1000:.0f}ms")
+                            first_chunk = False
+                        await websocket.send_json({"type": "tts_chunk", "payload": audio_b64})
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"[STREAM] TTS consumer error: {e}")
+
+        # Run producer and consumer concurrently
+        await asyncio.gather(llm_producer(), tts_consumer())
+        # ─────────────────────────────────────────────────────────────────────
+
+        answer = full_answer or "I'm having trouble thinking right now. Please try again."
         session.conversation_history.append({"role": "assistant", "content": answer})
 
+        # Send the final complete text (for UI to finalize the streaming bubble)
         try:
             await websocket.send_json({"type": "assistant_response", "payload": answer})
-            from get_audio import generate_speech_stream
-            async for audio_chunk_b64 in generate_speech_stream(answer):
-                await websocket.send_json({"type": "tts_chunk", "payload": audio_chunk_b64})
         except Exception as ws_err:
-            print(f"WebSocket closed: {ws_err}")
+            print(f"WebSocket send error (assistant_response): {ws_err}")
+
+        print(f"[LATENCY] Total question→done: {(time.time() - t_start)*1000:.0f}ms")
 
     except Exception as e:
         print(f"Error handling question: {e}")
@@ -632,15 +796,27 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
         session.vad_sample_buffer = session.vad_sample_buffer[VAD_WINDOW:]
         result = session.vad_iterator(window)
         if result:
+            if "start" in result:
+                # User started speaking (barge-in), cancel ongoing generation and TTS
+                session.is_processing = False
+                try:
+                    await websocket.send_json({"type": "interrupt_ack"})
+                except Exception:
+                    pass
             if "end" in result:
                 speech_ended = True
             
     if speech_ended:
         audio_data = bytes(session.audio_buffer)
         session.audio_buffer = bytearray()
+        buffer_duration_ms = len(audio_data) / (SAMPLE_RATE * 2) * 1000  # 16-bit = 2 bytes/sample
+        print(f"[LATENCY] Speech ended. Buffer: {buffer_duration_ms:.0f}ms of audio")
         
         try:
+            t_stt_start = time.time()
             transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
+            t_stt_end = time.time()
+            print(f"[LATENCY] STT took {(t_stt_end - t_stt_start)*1000:.0f}ms")
             if transcript and transcript.strip():
                 import re
                 transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
@@ -730,6 +906,208 @@ async def live_chat_websocket(websocket: WebSocket):
         try:
             await websocket.close()
         except:
+            pass
+
+@server.websocket("/api/audio_stream/ws")
+async def audio_stream_websocket(websocket: WebSocket):
+    """
+    Streaming WebSocket for the audio VAD chat mode.
+    Pipeline: audio_blob → STT → RAG retrieval → streaming Groq LLM → streaming TTS
+
+    Events sent to client:
+      transcript        – recognised speech text
+      text_chunk        – single LLM token (FAQ route) or full answer (general route)
+      tts_chunk         – base64 WAV audio chunk
+      assistant_response – final complete answer (signals end of turn)
+      error             – problem description
+    """
+    await websocket.accept()
+    print("[AUDIO WS] Connected")
+    try:
+        # ── Auth ─────────────────────────────────────────────────────────
+        auth_data = await websocket.receive_json()
+        payload   = auth_data.get("payload", {})
+        token      = payload.get("token", "")
+        session_id = payload.get("session_id", str(uuid.uuid4()))
+        try:
+            user_id = supabase.auth.get_user(token).user.id
+        except Exception:
+            await websocket.send_json({"type": "error", "payload": "Authentication failed"})
+            await websocket.close()
+            return
+
+        print(f"[AUDIO WS] Auth ok: {user_id}")
+        user_supabase = create_client(
+            SUPABASE_URL, SUPABASE_ANON_KEY,
+            options=ClientOptions(headers={"Authorization": f"Bearer {token}"})
+        )
+
+        # ── Message loop ──────────────────────────────────────────────────
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") != "audio_blob":
+                continue
+
+            t0 = time.time()
+            audio_bytes = base64.b64decode(data["payload"])
+
+            # 1. STT ─────────────────────────────────────────────────────
+            try:
+                transcript = await transcribe_audio_file(audio_bytes)
+            except Exception as e:
+                await websocket.send_json({"type": "error", "payload": f"STT failed: {e}"})
+                continue
+
+            import re as _re
+            transcript = _re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript or "")
+            print(f"[LATENCY] STT: {(time.time()-t0)*1000:.0f}ms → '{transcript}'")
+
+            if not transcript.strip():
+                await websocket.send_json({"type": "transcript", "payload": ""})
+                continue
+            await websocket.send_json({"type": "transcript", "payload": transcript})
+
+            # 2. Long-term memory ─────────────────────────────────────────
+            long_term_memory = ""
+            try:
+                mem = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+                if mem.data and mem.data[0].get("facts"):
+                    long_term_memory = "\n".join(mem.data[0]["facts"])
+            except Exception:
+                pass
+
+            # 3. RAG Retrieval (sync → thread executor) ──────────────────
+            from nodes import retrieve_node
+            from langchain_core.messages import HumanMessage as _HM
+            config = {"configurable": {"thread_id": session_id}}
+            retrieve_state = {
+                "question": transcript,
+                "messages": [_HM(content=transcript)],
+                "context": "", "answer": "",
+                "long_term_memory": long_term_memory,
+                "user_id": user_id, "token": token
+            }
+            t_ret = time.time()
+            retrieval_result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: retrieve_node(retrieve_state, config)
+            )
+            context = retrieval_result.get("context", "")
+            router  = retrieval_result.get("router", 1)
+            print(f"[LATENCY] Retrieval: {(time.time()-t_ret)*1000:.0f}ms, router={router}")
+
+            full_answer = ""
+            SENTENCE_ENDINGS = {'.', '!', '?'}
+            MIN_SENTENCE_LEN = 12
+
+            if router == 2 and context:
+                # ── FAQ: streaming Groq + parallel TTS ───────────────────
+                system_prompt = (
+                    "You are a helpful JIO customer support assistant. "
+                    "Unless specified otherwise in the LONG TERM MEMORY, your default name is Jio Assistant.\n"
+                    "Use the provided CONTEXT to answer the user's question about Jio.\n\n"
+                    f"USER'S LONG TERM MEMORY:\n{long_term_memory}\n\n"
+                    "INSTRUCTIONS:\n"
+                    "1. Answer using ONLY the provided context for Jio-related questions.\n"
+                    "2. If context doesn't contain the answer, say you couldn't find it in the Jio FAQs.\n"
+                    "3. Do not guess or fabricate information.\n\n"
+                    f"CONTEXT:\n{context}"
+                )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": transcript}
+                ]
+                tts_q: asyncio.Queue = asyncio.Queue()
+
+                async def faq_llm_producer():
+                    nonlocal full_answer
+                    buf = ""
+                    t_llm = time.time(); first = True
+                    try:
+                        async for chunk in primary_llm.astream(messages):
+                            tok = chunk.content
+                            if not tok:
+                                continue
+                            full_answer += tok; buf += tok
+                            if first:
+                                print(f"[LATENCY] LLM first token: {(time.time()-t_llm)*1000:.0f}ms")
+                                first = False
+                            try:
+                                await websocket.send_json({"type": "text_chunk", "payload": tok})
+                            except Exception:
+                                break
+                            s = buf.strip()
+                            if s and s[-1] in SENTENCE_ENDINGS and len(s) >= MIN_SENTENCE_LEN:
+                                await tts_q.put(asyncio.create_task(fetch_tts_sentence(s)))
+                                buf = ""
+                        print(f"[LATENCY] LLM done: {(time.time()-t_llm)*1000:.0f}ms")
+                        # Send the full text to the UI immediately!
+                        try:
+                            await websocket.send_json({"type": "assistant_response", "payload": full_answer})
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[AUDIO WS] LLM error: {e}")
+                    finally:
+                        if buf.strip():
+                            await tts_q.put(asyncio.create_task(fetch_tts_sentence(buf.strip())))
+                        await tts_q.put(None)
+
+                async def faq_tts_consumer():
+                    t_tts = time.time(); first = True
+                    while True:
+                        task = await tts_q.get()
+                        if task is None:
+                            break
+                        try:
+                            b64 = await task
+                            if b64:
+                                if first:
+                                    print(f"[LATENCY] TTS first chunk: {(time.time()-t_tts)*1000:.0f}ms")
+                                    first = False
+                                await websocket.send_json({"type": "tts_chunk", "payload": b64})
+                        except Exception as e:
+                            print(f"[AUDIO WS] TTS err: {e}")
+
+                await asyncio.gather(faq_llm_producer(), faq_tts_consumer())
+
+            else:
+                # ── General (tool-capable): blocking LLM + streaming TTS ─
+                from nodes import general_generation_node
+                gen_state = {**retrieve_state, "question": transcript,
+                             "messages": [_HM(content=transcript)]}
+                t_gen = time.time()
+                gen_result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: general_generation_node(gen_state)
+                )
+                full_answer = gen_result.get("answer", "I'm having trouble right now.")
+                print(f"[LATENCY] General LLM: {(time.time()-t_gen)*1000:.0f}ms")
+
+                # Send full text chunk immediately to UI!
+                await websocket.send_json({"type": "assistant_response", "payload": full_answer})
+                
+                sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', full_answer)
+                             if s.strip() and len(s.strip()) >= 8]
+                if not sentences:
+                    sentences = [full_answer]
+                tts_tasks = [asyncio.create_task(fetch_tts_sentence(s)) for s in sentences]
+                t_tts = time.time(); first = True
+                for task in tts_tasks:
+                    b64 = await task
+                    if b64:
+                        if first:
+                            print(f"[LATENCY] TTS first (general): {(time.time()-t_tts)*1000:.0f}ms")
+                            first = False
+                        await websocket.send_json({"type": "tts_chunk", "payload": b64})
+
+            print(f"[LATENCY] Total: {(time.time()-t0)*1000:.0f}ms")
+
+    except WebSocketDisconnect:
+        print("[AUDIO WS] Disconnected")
+    except Exception as e:
+        print(f"[AUDIO WS] Error: {e}")
+        try:
+            await websocket.close()
+        except Exception:
             pass
 
 @server.on_event("startup")

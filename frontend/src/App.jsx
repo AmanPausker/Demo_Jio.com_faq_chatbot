@@ -117,6 +117,10 @@ function App() {
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth >= 768);
+  const [showAllSessions, setShowAllSessions] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [longTermMemory, setLongTermMemory] = useState('');
+  const [memoryLoading, setMemoryLoading] = useState(false);
 
   const [messages, setMessages] = useState([
     { id: 1, role: 'bot', text: 'Hello! How can I help you today?' }
@@ -153,6 +157,12 @@ function App() {
 
   const ttsQueueRef = useRef([]);
   const isPlayingTTSRef = useRef(false);
+  const streamingMsgIdRef = useRef(null); // tracks the live-streaming bot message
+
+  // Audio-stream WebSocket (for VAD audio mode)
+  const audioStreamWsRef    = useRef(null);
+  const audioStreamTempIdRef = useRef(null); // "Transcribing..." placeholder message id
+  const audioStreamMsgIdRef  = useRef(null); // streaming bot message id
 
   const processTTSQueue = () => {
     if (isPlayingTTSRef.current || ttsQueueRef.current.length === 0) return;
@@ -182,13 +192,14 @@ function App() {
 
   const startLiveMode = async () => {
     try {
+      streamingMsgIdRef.current = null; // reset on each new session
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: 640, height: 360 }
       });
       setCameraStream(stream);
       if (videoRef.current) videoRef.current.srcObject = stream;
 
-      const socket = new WebSocket('ws://localhost:8000/api/live/ws');
+      const socket = new WebSocket('ws://10.141.177.237:8000/api/live/ws');
       socket.onopen = () => {
         socket.send(JSON.stringify({
           type: "auth",
@@ -198,10 +209,62 @@ function App() {
 
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.type === "assistant_response") {
-          setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.payload }]);
+
+        if (data.type === "text_chunk") {
+          // Progressive token streaming → build message bubble live
+          // IMPORTANT: use streamingMsgIdRef (ref, always current) NOT lastMsg.streaming
+          // (checking lastMsg inside setMessages closure sees stale state under rapid events)
+          const token = data.payload;
+          if (!streamingMsgIdRef.current) {
+            const id = crypto.randomUUID();
+            streamingMsgIdRef.current = id;
+            setMessages(prev => [...prev, { id, role: 'bot', text: token, streaming: true }]);
+          } else {
+            const id = streamingMsgIdRef.current;
+            setMessages(prev => prev.map(m =>
+              m.id === id ? { ...m, text: m.text + token } : m
+            ));
+          }
+
+        } else if (data.type === "assistant_response") {
+          // Finalize the streaming bubble with the complete text
+          setMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg && lastMsg.streaming) {
+              return prev.map((m, i) =>
+                i === prev.length - 1 ? { ...m, text: data.payload, streaming: false } : m
+              );
+            }
+            return [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.payload }];
+          });
+          streamingMsgIdRef.current = null;
+
         } else if (data.type === "tts_chunk") {
           appendTTSChunk(data.payload);
+
+        } else if (data.type === "transcript") {
+          // Show user speech transcript as a user message
+          setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: data.payload }]);
+
+        } else if (data.type === "interrupt_ack") {
+          // Barge-in: finalize any incomplete streaming bubble
+          setMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg && lastMsg.streaming) {
+              return prev.map((m, i) =>
+                i === prev.length - 1 ? { ...m, streaming: false } : m
+              );
+            }
+            return prev;
+          });
+          streamingMsgIdRef.current = null;
+          // Also flush TTS queue on interrupt
+          ttsQueueRef.current = [];
+          isPlayingTTSRef.current = false;
+          if (audioPlayerRef.current && !audioPlayerRef.current.paused) {
+            audioPlayerRef.current.pause();
+          }
+
         } else if (data.type === "visual_summary") {
           console.log("AI sees:", data.payload);
         } else if (data.type === "error") {
@@ -325,6 +388,79 @@ function App() {
     setMode('text');
   };
 
+  // ── Audio-stream WebSocket (VAD mode) ────────────────────────────────────
+  const connectAudioStreamWs = (token, sid) => {
+    if (audioStreamWsRef.current) {
+      audioStreamWsRef.current.close();
+      audioStreamWsRef.current = null;
+    }
+    const socket = new WebSocket('ws://10.141.177.237:8000/api/audio_stream/ws');
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: 'auth', payload: { token, session_id: sid } }));
+      console.log('[AUDIO WS] Connected');
+    };
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === 'transcript') {
+        // Replace "Transcribing..." with actual speech
+        const tid = audioStreamTempIdRef.current;
+        if (tid) {
+          if (data.payload) {
+            setMessages(prev => prev.map(m =>
+              m.id === tid ? { ...m, text: `\uD83C\uDFA4 ${data.payload}` } : m
+            ));
+          } else {
+            setMessages(prev => prev.filter(m => m.id !== tid));
+          }
+          audioStreamTempIdRef.current = null;
+        }
+
+      } else if (data.type === 'text_chunk') {
+        const tok = data.payload;
+        if (!audioStreamMsgIdRef.current) {
+          const id = crypto.randomUUID();
+          audioStreamMsgIdRef.current = id;
+          setMessages(prev => [...prev, { id, role: 'bot', text: tok, streaming: true }]);
+        } else {
+          const id = audioStreamMsgIdRef.current;
+          setMessages(prev => prev.map(m =>
+            m.id === id ? { ...m, text: m.text + tok } : m
+          ));
+        }
+
+      } else if (data.type === 'tts_chunk') {
+        appendTTSChunk(data.payload);
+
+      } else if (data.type === 'assistant_response') {
+        const id = audioStreamMsgIdRef.current;
+        if (id) {
+          setMessages(prev => prev.map(m =>
+            m.id === id ? { ...m, text: data.payload, streaming: false } : m
+          ));
+          audioStreamMsgIdRef.current = null;
+        } else {
+          setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'bot', text: data.payload }]);
+        }
+        setIsLoading(false);
+        fetchSessions();
+
+      } else if (data.type === 'error') {
+        console.error('[AUDIO WS]', data.payload);
+        setIsLoading(false);
+      }
+    };
+    socket.onclose = () => {
+      console.log('[AUDIO WS] Closed');
+      audioStreamWsRef.current = null;
+    };
+    socket.onerror = (e) => {
+      console.error('[AUDIO WS] Error', e);
+      audioStreamWsRef.current = null;
+    };
+    audioStreamWsRef.current = socket;
+  };
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -345,10 +481,28 @@ function App() {
     scrollToBottom();
   }, [messages]);
 
+  const handleOpenSettings = async () => {
+    setShowSettingsModal(true);
+    if (!session?.access_token) return;
+    setMemoryLoading(true);
+    try {
+      const res = await fetch('http://10.141.177.237:8000/api/memory', {
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      });
+      const data = await res.json();
+      setLongTermMemory(data.memory || 'No long-term memory stored yet.');
+    } catch (err) {
+      console.error(err);
+      setLongTermMemory('Failed to load memory.');
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
+
   const fetchSessions = async () => {
     if (!session?.access_token) return;
     try {
-      const res = await fetch('http://localhost:8000/api/sessions', {
+      const res = await fetch('http://10.141.177.237:8000/api/sessions', {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -375,6 +529,23 @@ function App() {
     if (window.innerWidth < 768) setIsSidebarOpen(false);
   };
 
+  const handleDeleteSession = async (sessionId, e) => {
+    e.stopPropagation();
+    if (!session?.access_token) return;
+    try {
+      await fetch(`http://10.141.177.237:8000/api/sessions/${sessionId}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      });
+      fetchSessions();
+      if (activeSessionId === sessionId) {
+        handleNewChat();
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  };
+
   const loadSessionHistory = async (sessionId) => {
     setActiveSessionId(sessionId);
     setMode('text');
@@ -382,7 +553,7 @@ function App() {
     setMessages([{ id: crypto.randomUUID(), role: 'bot', text: 'Loading history...' }]);
     if (!session?.access_token) return;
     try {
-      const res = await fetch(`http://localhost:8000/api/sessions/${sessionId}/history`, {
+      const res = await fetch(`http://10.141.177.237:8000/api/sessions/${sessionId}/history`, {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -390,7 +561,8 @@ function App() {
          const historyMsgs = data.history.map(msg => ({
            id: crypto.randomUUID(),
            role: msg.type === 'user' ? 'user' : 'bot',
-           text: msg.content
+           text: msg.content,
+           a2ui_messages: msg.a2ui_messages
          }));
          if (historyMsgs.length === 0) {
              historyMsgs.push({ id: crypto.randomUUID(), role: 'bot', text: 'Hello! How can I help you today?' });
@@ -407,7 +579,17 @@ function App() {
     if (mode === 'file') setUploadResult(null);
     if (mode === 'image') { setGeneratedImage(null); setImagePrompt(''); }
     if (mode !== 'live' && liveMode) stopLiveMode();
-  }, [mode]);
+
+    // Connect / disconnect audio-stream WebSocket
+    if (mode === 'audio' && session?.access_token) {
+      connectAudioStreamWs(session.access_token, activeSessionId);
+    } else {
+      if (audioStreamWsRef.current) {
+        audioStreamWsRef.current.close();
+        audioStreamWsRef.current = null;
+      }
+    }
+  }, [mode, session?.access_token, activeSessionId]);
 
   const unlockAudio = () => {
     if (audioPlayerRef.current) {
@@ -427,7 +609,7 @@ function App() {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const response = await fetch('http://localhost:8000/api/upload', {
+      const response = await fetch('http://10.141.177.237:8000/api/upload', {
         method: 'POST',
         body: formData,
       });
@@ -469,7 +651,7 @@ function App() {
     const formData = new FormData();
     formData.append("image", file);
     try {
-      const response = await fetch('http://localhost:8000/api/vision', {
+      const response = await fetch('http://10.141.177.237:8000/api/vision', {
         method: 'POST',
         body: formData
       });
@@ -540,7 +722,7 @@ function App() {
     setGeneratedImage(null);
     setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: `\uD83C\uDFA8 Create image: ${prompt}` }]);
     try {
-      const response = await fetch('http://localhost:8000/api/generate_image', {
+      const response = await fetch('http://10.141.177.237:8000/api/generate_image', {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
@@ -575,7 +757,7 @@ function App() {
     if (userMsg.text.startsWith('/imagine ')) {
       const prompt = userMsg.text.replace('/imagine ', '');
       try {
-        const response = await fetch('http://localhost:8000/api/generate_image', {
+        const response = await fetch('http://10.141.177.237:8000/api/generate_image', {
           method: "POST",
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt })
@@ -599,7 +781,7 @@ function App() {
       return;
     }
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
+      const response = await fetch('http://10.141.177.237:8000/api/chat', {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -623,34 +805,47 @@ function App() {
   };
 
   const sendAudioMessage = async (audioBlob) => {
+    unlockAudio();
+
+    // ── Streaming path: use WebSocket if open ───────────────────────────────
+    if (audioStreamWsRef.current && audioStreamWsRef.current.readyState === WebSocket.OPEN) {
+      audioStreamMsgIdRef.current = null;
+      const tid = crypto.randomUUID();
+      audioStreamTempIdRef.current = tid;
+      setMessages(prev => [...prev, { id: tid, role: 'user', text: '\uD83C\uDFA4 [Transcribing...]' }]);
+      setIsLoading(true);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const b64 = reader.result.split(',')[1];
+        if (audioStreamWsRef.current?.readyState === WebSocket.OPEN) {
+          audioStreamWsRef.current.send(JSON.stringify({ type: 'audio_blob', payload: b64 }));
+        }
+      };
+      reader.readAsDataURL(audioBlob);
+      return;
+    }
+
+    // ── Fallback: REST API ──────────────────────────────────────────────────
     setIsLoading(true);
     playVoiceFiller();
     const tempId = crypto.randomUUID();
     setMessages(prev => [...prev, { id: tempId, role: 'user', text: '\uD83C\uDFA4 [Transcribing...]' }]);
     const formData = new FormData();
     formData.append('audio', audioBlob, 'recording.wav');
-    if (activeSessionId) {
-      formData.append('session_id', activeSessionId);
-    }
+    if (activeSessionId) formData.append('session_id', activeSessionId);
     try {
-      const response = await fetch('http://localhost:8000/api/chat/audio', {
+      const response = await fetch('http://10.141.177.237:8000/api/chat/audio', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${session?.access_token}`
-        },
+        headers: { 'Authorization': `Bearer ${session?.access_token}` },
         body: formData
       });
-      fetchSessions(); // Refresh sidebar titles
+      fetchSessions();
       const data = await response.json();
-      if (data.a2ui_messages && data.a2ui_messages.length > 0) {
-        processor.processMessages(data.a2ui_messages);
-      }
+      if (data.a2ui_messages && data.a2ui_messages.length > 0) processor.processMessages(data.a2ui_messages);
       setMessages(prev => {
         const filtered = prev.filter(m => m.id !== tempId);
         const newMessages = [...filtered];
-        if (data.user_message) {
-          newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `\uD83C\uDFA4 ${data.user_message}` });
-        }
+        if (data.user_message) newMessages.push({ id: crypto.randomUUID(), role: 'user', text: `\uD83C\uDFA4 ${data.user_message}` });
         newMessages.push({ id: crypto.randomUUID(), role: 'bot', text: data.text, surfaceId: data.surface_id });
         return newMessages;
       });
@@ -797,6 +992,31 @@ function App() {
 
   return (
     <div className="app-layout">
+      {/* Settings Modal */}
+      {showSettingsModal && (
+        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div className="modal-content" style={{ background: 'var(--bg-color)', padding: '24px', borderRadius: '12px', width: '90%', maxWidth: '500px', boxShadow: '0 4px 20px rgba(0,0,0,0.2)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <h2 style={{ margin: 0, fontSize: '1.5em', color: 'var(--text-primary)' }}>Settings</h2>
+              <button onClick={() => setShowSettingsModal(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              </button>
+            </div>
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ display: 'block', marginBottom: '8px', color: 'var(--text-secondary)', fontWeight: 'bold' }}>User Email</label>
+              <div style={{ padding: '12px', background: 'var(--surface-color)', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', wordBreak: 'break-all' }}>
+                {session?.user?.email || 'N/A'}
+              </div>
+            </div>
+            <div>
+              <label style={{ display: 'block', marginBottom: '8px', color: 'var(--text-secondary)', fontWeight: 'bold' }}>Long-Term Memory</label>
+              <div style={{ padding: '12px', background: 'var(--surface-color)', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', minHeight: '100px', whiteSpace: 'pre-wrap' }}>
+                {memoryLoading ? 'Loading...' : longTermMemory}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {/* SIDEBAR UI */}
       <div className={`sidebar ${isSidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-header">
@@ -815,29 +1035,52 @@ function App() {
               <span className="session-title">New Chat</span>
             </div>
           )}
-          {sessions.map(s => (
+          {(showAllSessions ? sessions : sessions.slice(0, 5)).map(s => (
             <div 
               key={s.id} 
               className={`session-item ${activeSessionId === s.id ? 'active' : ''}`}
               onClick={() => loadSessionHistory(s.id)}
             >
-              <ChatIcon />
-              <span className="session-title">{s.title || 'New Chat'}</span>
+              <div style={{display: 'flex', alignItems: 'center', gap: '12px', flex: 1, overflow: 'hidden'}}>
+                <ChatIcon />
+                <span className="session-title">{s.title || 'New Chat'}</span>
+              </div>
+              <button className="delete-session-btn" onClick={(e) => handleDeleteSession(s.id, e)} title="Delete chat">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+              </button>
             </div>
           ))}
+          {sessions.length > 5 && !showAllSessions && (
+            <button className="load-more-btn" onClick={() => setShowAllSessions(true)} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', padding: '10px', width: '100%', cursor: 'pointer', textAlign: 'center', fontSize: '0.9em' }}>
+              Load More
+            </button>
+          )}
           {sessions.length === 0 && !activeSessionId && <div className="no-sessions">No previous chats</div>}
         </div>
         <div className="sidebar-footer">
-          <button className="logout-btn" onClick={() => supabase.auth.signOut()}>Sign Out</button>
+          <button className="settings-btn" onClick={handleOpenSettings} style={{ marginBottom: '10px', width: '100%', display: 'flex', alignItems: 'center', gap: '8px', padding: '10px', borderRadius: '8px', background: 'transparent', border: 'none', color: 'var(--text-primary)', cursor: 'pointer', textAlign: 'left', fontWeight: 500 }}>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            Settings
+          </button>
+          <button className="logout-btn" onClick={() => supabase.auth.signOut()}>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+            Sign Out
+          </button>
         </div>
       </div>
 
       <div className="chat-container">
-        {!isSidebarOpen && (
-           <button className="open-sidebar-btn" onClick={() => setIsSidebarOpen(true)}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
-           </button>
-        )}
+        <div className="chat-header">
+          {!isSidebarOpen && (
+             <button className="open-sidebar-btn" onClick={() => setIsSidebarOpen(true)}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+             </button>
+          )}
+          <div className="chat-header-title"></div>
+          <button className="settings-btn" title="Settings">
+             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          </button>
+        </div>
       {mode === 'live' ? (
         <div className="live-view">
           <div className="live-header">
@@ -859,7 +1102,10 @@ function App() {
                 <span className="live-msg-label">
                   {m.role === 'user' ? 'You' : 'AI'}
                 </span>
-                <span className="live-msg-text">{m.text}</span>
+                <span className="live-msg-text">
+                  {m.text}
+                  {m.streaming && <span className="streaming-cursor" />}
+                </span>
               </div>
             ))}
           </div>
