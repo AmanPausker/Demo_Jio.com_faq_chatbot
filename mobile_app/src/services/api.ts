@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.139.211.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.141.177.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -125,5 +125,16 @@ export const generateImage = async (prompt: string) => {
   } catch (error) {
     console.error('Generate image error', error);
     throw error;
+  }
+};
+
+export const fetchMemory = async () => {
+  try {
+    const headers = await getHeaders();
+    const response = await axios.get(`${API_URL}/api/memory`, { headers });
+    return response.data.memory || 'No long-term memory stored yet.';
+  } catch (error) {
+    console.error('Failed to fetch memory:', error);
+    return 'Failed to load memory.';
   }
 };

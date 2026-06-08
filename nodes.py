@@ -31,8 +31,8 @@ from langchain_core.tools import tool
 
 @tool
 def save_user_memory(fact: str) -> str:
-    """Use this tool to permanently save a fact across all chat sessions. This includes personal facts about the user (e.g. their name, preferences) AND facts about your own identity (e.g. if the user gives you a new name).
-    CRITICAL: Be extremely clear about pronouns. If the user tells you their name, save it as 'The user's name is X'. If the user gives YOU (the AI assistant) a new name, save it as 'The assistant's name is X'. Do not confuse the two!"""
+    """Use this tool to permanently save a fact across all chat sessions. This includes personal facts about the user (e.g. their name, preferences) AND facts about your own identity.
+    CRITICAL: Save ONLY concise, atomic facts (e.g., "User's name is Aman", "User likes red"). DO NOT save conversational loops, verbatim dialogue, generic statements, or ephemeral actions (e.g. "User asked for the weather"). Be extremely clear about pronouns. If the user tells you their name, save it as 'The user's name is X'."""
     pass
 
 
@@ -55,12 +55,14 @@ def general_generation_node(State: GraphState):
     CRITICAL RULE: You MUST remember and acknowledge the user's name or personal details if they tell you.
     If the user tells you something about you (like assigning you a new name), you must prioritize that new name and remember it!
     DO NOT say "I don't retain information" - you DO have access to history and long-term memory!
-    If a new fact is revealed about the user OR about your own identity, YOU MUST call the `save_user_memory` tool to save it.
+    If a new concise fact is revealed about the user OR about your own identity, YOU MUST call the `save_user_memory` tool to save it.
+    CRITICAL: DO NOT save conversational loops, verbatim dialogue, or ephemeral queries (like asking for the weather). Only save explicit, atomic, long-term facts (e.g. "User's name is Aman").
     
     CRITICAL TOOL USAGE:
     1. If the user asks for the weather in a specific city, use the `get_weather` tool.
     2. If the user asks for the weather "here", "my location", or does not specify a city, you MUST first call the `get_current_location` tool to find their city, and THEN call the `get_weather` tool with that city. Do NOT ask the user for their location!
     3. When calling a tool, do NOT output anything else. Just call the tool.
+    4. You MUST call only ONE tool at a time. NEVER call multiple tools in a single response. Wait for the result before calling the next tool.
     
     [WEATHER OUTPUT FORMAT]
     If and ONLY if you have successfully fetched the weather data, respond ONLY with the raw A2UI JSON object. 
@@ -81,7 +83,10 @@ def general_generation_node(State: GraphState):
     try:
         response = llm_with_tools.invoke(messages)
 
-        while response.tool_calls:
+        max_tool_rounds = 5
+        tool_round = 0
+        while response.tool_calls and tool_round < max_tool_rounds:
+            tool_round += 1
             messages.append(response)
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
@@ -93,24 +98,29 @@ def general_generation_node(State: GraphState):
                     tool_output = get_current_location.invoke(tool_args)
                 elif tool_name == "save_user_memory":
                     print(f"LLM called save_user_memory with args: {tool_args}")
-                    fact = tool_args.get("fact")
-                    try:
-                        from supabase import create_client, ClientOptions
-                        user_supabase = create_client(os.getenv("VITE_SUPABASE_URL"), os.getenv("VITE_SUPABASE_ANON_KEY"), options=ClientOptions(headers={"Authorization": f"Bearer {State['token']}"}))
-                        res = user_supabase.table("user_memory").select("facts").eq("user_id", State['user_id']).execute()
-                        existing_facts = res.data[0].get("facts", []) if res.data else []
-                        if existing_facts is None: existing_facts = []
-                        existing_facts.append(fact)
-                        
-                        if res.data:
-                            user_supabase.table("user_memory").update({"facts": existing_facts}).eq("user_id", State['user_id']).execute()
-                        else:
-                            user_supabase.table("user_memory").insert({"user_id": State['user_id'], "facts": existing_facts}).execute()
-                        tool_output = f"Successfully saved memory: {fact}"
-                        print(tool_output)
-                    except Exception as e:
-                        tool_output = f"Failed to save memory: {e}"
-                        print(tool_output)
+                    fact = tool_args.get("fact", "")
+                    # Reject garbage facts that are too short or generic
+                    if len(fact.strip()) < 10 or fact.strip().lower() in ["the user", "the assistant", "user", "assistant"]:
+                        tool_output = f"Rejected: fact too short or generic: '{fact}'"
+                        print(f"[WARN] {tool_output}")
+                    else:
+                        try:
+                            from supabase import create_client, ClientOptions
+                            user_supabase = create_client(os.getenv("VITE_SUPABASE_URL"), os.getenv("VITE_SUPABASE_ANON_KEY"), options=ClientOptions(headers={"Authorization": f"Bearer {State['token']}"}))
+                            res = user_supabase.table("user_memory").select("facts").eq("user_id", State['user_id']).execute()
+                            existing_facts = res.data[0].get("facts", []) if res.data else []
+                            if existing_facts is None: existing_facts = []
+                            existing_facts.append(fact)
+                            
+                            if res.data:
+                                user_supabase.table("user_memory").update({"facts": existing_facts}).eq("user_id", State['user_id']).execute()
+                            else:
+                                user_supabase.table("user_memory").insert({"user_id": State['user_id'], "facts": existing_facts}).execute()
+                            tool_output = f"Successfully saved memory: {fact}"
+                            print(tool_output)
+                        except Exception as e:
+                            tool_output = f"Failed to save memory: {e}"
+                            print(tool_output)
                 else:
                     tool_output = "Unknown tool"
                     
@@ -118,8 +128,35 @@ def general_generation_node(State: GraphState):
                 messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
                 
             response = llm_with_tools.invoke(messages)
+        
+        if tool_round >= max_tool_rounds:
+            print(f"[WARN] Tool call loop hit max {max_tool_rounds} rounds, breaking out")
+        
+        answer = response.content
+        
+        # Guard: if the model leaked a tool call as plain text instead of using
+        # the structured tool API, retry without tools to get a real answer.
+        import re as _re
+        tool_leak_patterns = [
+            r'function\s*[:\(]',           # function:get_weather or function(
+            r'get_weather',                 # raw tool name
+            r'get_current_location',        # raw tool name
+            r'save_user_memory',            # raw tool name
+            r'</?tool_call>',               # XML tool tags
+            r'"name"\s*:\s*"get_',          # JSON tool format
+            r'parameters\s*[:\{]',          # parameters: or parameters{
+            r'\btool\s*call\b',             # "tool call"
+        ]
+        combined_pattern = '|'.join(tool_leak_patterns)
+        if _re.search(combined_pattern, answer, _re.IGNORECASE):
+            print(f"[WARN] Model leaked tool call as text, retrying without tools.")
+            print(f"[WARN] Original answer: {answer[:200]}")
+            plain_llm = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+            plain_messages = [SystemMessage(content=system_prompt)] + State["messages"]
+            response = plain_llm.invoke(plain_messages)
+            answer = response.content
             
-        return {"answer": response.content, "messages":[response]}
+        return {"answer": answer, "messages":[response]}
     except Exception as e:
         print(f"LLM Generation Error: {e}")
         return {"answer": "I'm sorry, but I couldn't process that request properly. Could you try rephrasing?"}

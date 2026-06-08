@@ -1,17 +1,40 @@
 import { Drawer } from 'expo-router/drawer';
-import { View, Text, TouchableOpacity, StyleSheet, FlatList } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, FlatList, Modal, ActivityIndicator, ScrollView } from 'react-native';
 import { useEffect, useState } from 'react';
-import { fetchSessions } from '../../services/api';
+import { fetchSessions, fetchMemory } from '../../services/api';
 import { Feather } from '@expo/vector-icons';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useDrawerStatus } from '@react-navigation/drawer';
+import { supabase } from '../../utils/supabaseClient';
 
 function CustomDrawerContent(props: any) {
   const [sessions, setSessions] = useState<any[]>([]);
+  const [showAllSessions, setShowAllSessions] = useState(false);
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [longTermMemory, setLongTermMemory] = useState('');
+  const [memoryLoading, setMemoryLoading] = useState(false);
+
   const router = useRouter();
   const params = useLocalSearchParams();
   const activeSessionId = params.sessionId as string;
   const isDrawerOpen = useDrawerStatus() === 'open';
+
+  const handleOpenSettings = async () => {
+    setSettingsVisible(true);
+    setMemoryLoading(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      setUserId(session?.user?.email || 'N/A');
+      const memory = await fetchMemory();
+      setLongTermMemory(memory);
+    } catch (err) {
+      console.error(err);
+      setLongTermMemory('Failed to load memory.');
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
 
   // Fetch when drawer opens
   useEffect(() => {
@@ -59,7 +82,7 @@ function CustomDrawerContent(props: any) {
 
 
       <FlatList
-        data={sessions}
+        data={showAllSessions ? sessions : sessions.slice(0, 5)}
         keyExtractor={(item, index) => item.session_id ? item.session_id.toString() : index.toString()}
         contentContainerStyle={{ padding: 12 }}
         renderItem={({ item }) => (
@@ -73,7 +96,55 @@ function CustomDrawerContent(props: any) {
             </Text>
           </TouchableOpacity>
         )}
+        ListFooterComponent={() => (
+          <>
+            {sessions.length > 5 && (
+              <TouchableOpacity onPress={() => setShowAllSessions(!showAllSessions)} style={{ padding: 12, alignItems: 'center' }}>
+                <Text style={{ color: '#a1a1aa', fontSize: 14 }}>{showAllSessions ? 'Show Less' : 'Load More'}</Text>
+              </TouchableOpacity>
+            )}
+          </>
+        )}
       />
+
+      <TouchableOpacity style={styles.settingsBtn} onPress={handleOpenSettings}>
+        <Feather name="settings" size={20} color="#a1a1aa" />
+        <Text style={styles.settingsText}>Settings</Text>
+      </TouchableOpacity>
+
+      <Modal
+        visible={settingsVisible}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setSettingsVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Settings</Text>
+              <TouchableOpacity onPress={() => setSettingsVisible(false)}>
+                <Feather name="x" size={24} color="#a1a1aa" />
+              </TouchableOpacity>
+            </View>
+            
+            <Text style={styles.modalLabel}>User Email</Text>
+            <View style={styles.modalBox}>
+              <Text style={styles.modalText}>{userId || 'Loading...'}</Text>
+            </View>
+
+            <Text style={styles.modalLabel}>Long-Term Memory</Text>
+            <View style={[styles.modalBox, { flex: 1, minHeight: 150 }]}>
+              {memoryLoading ? (
+                <ActivityIndicator color="#a855f7" />
+              ) : (
+                <ScrollView>
+                  <Text style={styles.modalText}>{longTermMemory}</Text>
+                </ScrollView>
+              )}
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -143,5 +214,58 @@ const styles = StyleSheet.create({
   activeSessionText: {
     color: '#e4e4e7',
     fontWeight: '500',
+  },
+  settingsBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+    paddingBottom: 48,
+    borderTopWidth: 1,
+    borderTopColor: '#27272a',
+  },
+  settingsText: {
+    color: '#a1a1aa',
+    fontSize: 16,
+    marginLeft: 12,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    width: '90%',
+    maxHeight: '80%',
+    backgroundColor: '#18181b',
+    borderRadius: 12,
+    padding: 20,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  modalTitle: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  modalLabel: {
+    color: '#a1a1aa',
+    fontSize: 14,
+    marginBottom: 8,
+    fontWeight: 'bold',
+  },
+  modalBox: {
+    backgroundColor: '#27272a',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  modalText: {
+    color: '#e4e4e7',
+    fontSize: 14,
   },
 });

@@ -7,6 +7,7 @@ import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../../utils/supabaseClient';
+import { WaveAnimation, WaveType } from '../../components/WaveAnimation';
 
 // PCM encoding buffer
 const pcmEncode = (audioData: Float32Array): ArrayBuffer => {
@@ -45,6 +46,11 @@ export default function LiveChatScreen() {
   const ttsQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const soundRef = useRef<Audio.Sound | null>(null);
+
+  // Animation states
+  const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
+  const [userSpeaking, setUserSpeaking] = useState(false);
+  const userSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Audio recording refs
   const audioRecorderRef = useRef<any>(null);
@@ -89,7 +95,7 @@ export default function LiveChatScreen() {
           frameInterval = setInterval(async () => {
             if (!mounted || !cameraRef.current) return;
             try {
-              const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.1, shutterSound: false });
+              const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, shutterSound: false });
               if (photo && photo.base64 && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: "video_frame", payload: photo.base64 }));
               }
@@ -136,10 +142,12 @@ export default function LiveChatScreen() {
   const playNextTTS = async () => {
     if (isPlayingRef.current || ttsQueueRef.current.length === 0) return;
     isPlayingRef.current = true;
+    setIsAssistantSpeaking(true);
     const b64 = ttsQueueRef.current.shift();
     
     if (!b64) {
         isPlayingRef.current = false;
+        setIsAssistantSpeaking(false);
         playNextTTS();
         return;
     }
@@ -153,6 +161,7 @@ export default function LiveChatScreen() {
         if (status.didJustFinish) {
           sound.unloadAsync();
           isPlayingRef.current = false;
+          setIsAssistantSpeaking(false);
           playNextTTS();
         }
       });
@@ -160,6 +169,7 @@ export default function LiveChatScreen() {
     } catch (e) {
       console.error("Audio playback error:", e);
       isPlayingRef.current = false;
+      setIsAssistantSpeaking(false);
       playNextTTS();
     }
   };
@@ -193,6 +203,10 @@ export default function LiveChatScreen() {
     if (isPlayingRef.current) return;
 
     if (db > VOLUME_THRESHOLD) {
+      setUserSpeaking(true);
+      if (userSpeakingTimeoutRef.current) clearTimeout(userSpeakingTimeoutRef.current);
+      userSpeakingTimeoutRef.current = setTimeout(() => setUserSpeaking(false), 1000);
+
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
         silenceTimerRef.current = null;
@@ -202,6 +216,7 @@ export default function LiveChatScreen() {
         if (soundRef.current && isPlayingRef.current) {
           soundRef.current.stopAsync().catch(() => {});
           isPlayingRef.current = false;
+          setIsAssistantSpeaking(false);
         }
         ws.send(JSON.stringify({ type: "interrupt" }));
       }
@@ -247,6 +262,8 @@ export default function LiveChatScreen() {
     );
   }
 
+  const waveType: WaveType = userSpeaking ? 'user' : isAssistantSpeaking ? 'assistant' : 'idle';
+
   return (
     <View style={styles.container}>
       <CameraView style={styles.camera} facing="back" ref={cameraRef}>
@@ -259,6 +276,8 @@ export default function LiveChatScreen() {
             <View style={styles.recordingDot} />
           </View>
           
+          <WaveAnimation type={waveType} />
+
           <ScrollView 
             style={styles.messagesScrollView} 
             contentContainerStyle={styles.messagesContent}
