@@ -51,11 +51,26 @@ export default function ChatScreen() {
     try {
       const history = await loadSessionHistory(id);
       if (history && history.length > 0) {
-        const formattedHistory = history.map((msg: any) => ({
-          id: Date.now().toString() + Math.random(),
-          role: msg.type === 'user' ? 'user' : 'bot',
-          text: msg.content
-        }));
+        const formattedHistory = history.map((msg: any) => {
+          let a2uiComponents = null;
+          if (msg.a2ui_messages && msg.a2ui_messages.length > 0) {
+            for (const a2ui of msg.a2ui_messages) {
+              if (a2ui.updateComponents) {
+                for (const comp of a2ui.updateComponents.components) {
+                  if (comp.component === 'WeatherCard') {
+                    a2uiComponents = comp.props;
+                  }
+                }
+              }
+            }
+          }
+          return {
+            id: Date.now().toString() + Math.random(),
+            role: msg.type === 'user' ? 'user' : 'bot',
+            text: msg.content,
+            weather: a2uiComponents
+          };
+        });
         setMessages(formattedHistory);
       } else {
         handleNewChat();
@@ -188,7 +203,7 @@ export default function ChatScreen() {
             if (msg.updateComponents) {
               for (const comp of msg.updateComponents.components) {
                 if (comp.component === 'WeatherCard') {
-                  a2uiComponents = comp;
+                  a2uiComponents = comp.props;
                 }
               }
             }
@@ -252,6 +267,12 @@ export default function ChatScreen() {
         (status) => {
           if (status.metering) {
             handleMetering(status.metering);
+          }
+          if (status.durationMillis && status.durationMillis > 28000) {
+            if (isSpeakingState.current) {
+              isSpeakingState.current = false;
+              handleSpeechEnd();
+            }
           }
         },
         100 // polling interval
@@ -397,7 +418,7 @@ export default function ChatScreen() {
           if (msg.updateComponents) {
             for (const comp of msg.updateComponents.components) {
               if (comp.component === 'WeatherCard') {
-                a2uiComponents = comp;
+                a2uiComponents = comp.props;
               }
             }
           }
