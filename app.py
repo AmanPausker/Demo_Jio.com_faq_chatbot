@@ -5,7 +5,6 @@ from nodes import retrieve_node, generate_node, general_generation_node
 
 workflow = StateGraph(GraphState)
 
-
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("generate", generate_node)
 workflow.add_node("general_generation", general_generation_node)
@@ -22,6 +21,7 @@ workflow.add_conditional_edges("retrieve", route_request, {
     "general_generation": "general_generation",
     "generate": "generate"
 })
+
 workflow.add_edge('generate', END)
 workflow.add_edge('general_generation', END)
 

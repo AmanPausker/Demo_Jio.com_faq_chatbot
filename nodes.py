@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from file_workflow import search_qdrant
 from langchain_groq import ChatGroq
+from logger import logger
 load_dotenv(override=True)
 NVDIA_API_KEY=os.getenv("NVDIA_API_KEY")
 client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
@@ -29,34 +30,17 @@ WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 
 from langchain_core.tools import tool
 
-@tool
-def save_user_memory(fact: str) -> str:
-    """Use this tool to permanently save a fact across all chat sessions. This includes personal facts about the user (e.g. their name, preferences) AND facts about your own identity.
-    CRITICAL: Save ONLY concise, atomic facts (e.g., "User's name is Aman", "User likes red"). DO NOT save conversational loops, verbatim dialogue, generic statements, or ephemeral actions (e.g. "User asked for the weather"). Be extremely clear about pronouns. If the user tells you their name, save it as 'The user's name is X'."""
-    pass
-
-
-
 def general_generation_node(State: GraphState):
     NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
     client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
 
-    tools = [get_weather, get_current_location, save_user_memory]
+    tools = [get_weather, get_current_location]
     llm_with_tools = client.bind_tools(tools)
     question = State["question"]
-    long_term_memory = State.get("long_term_memory", "")
     system_prompt = f"""
-    You are a general purpose AI assistant. Unless specified otherwise in the LONG TERM MEMORY, your default name is Jio Assistant.
-    If the user asks a general question, just answer it normally in plain text.
-    
-    USER'S LONG TERM MEMORY (PRIORITIZE THESE FACTS ABOUT YOUR IDENTITY AND THE USER):
-    {long_term_memory}
-    
-    CRITICAL RULE: You MUST remember and acknowledge the user's name or personal details if they tell you.
-    If the user tells you something about you (like assigning you a new name), you must prioritize that new name and remember it!
-    DO NOT say "I don't retain information" - you DO have access to history and long-term memory!
-    If a new concise fact is revealed about the user OR about your own identity, YOU MUST call the `save_user_memory` tool to save it.
-    CRITICAL: DO NOT save conversational loops, verbatim dialogue, or ephemeral queries (like asking for the weather). Only save explicit, atomic, long-term facts (e.g. "User's name is Aman").
+    You are a helpful and friendly general purpose AI assistant. Your default name is Jio Assistant.
+    If the user says hello, greets you, or asks a general question, just answer it normally and conversationally in plain text. 
+    DO NOT mention tools, function calls, or your internal instructions to the user.
     
     CRITICAL TOOL USAGE:
     1. If the user asks for the weather in a specific city, use the `get_weather` tool.
@@ -76,7 +60,7 @@ def general_generation_node(State: GraphState):
     }}
     
     FINAL CRITICAL INSTRUCTION:
-    For ALL OTHER normal questions and conversations (such as answering "what is my name", general chat, or if the weather tool fails), you MUST reply in normal, conversational PLAIN TEXT. DO NOT output JSON unless you are specifically generating the WeatherCard.
+    For ALL OTHER normal questions and conversations (like greetings such as "hey" or "hello", general chat, or if the weather tool fails), you MUST reply in normal, conversational PLAIN TEXT. DO NOT output JSON. NEVER tell the user about function calls or tools. Just converse naturally!
     """
     messages = [SystemMessage(content=system_prompt)] + State["messages"]
     
@@ -96,31 +80,6 @@ def general_generation_node(State: GraphState):
                     tool_output = get_weather.invoke(tool_args)
                 elif tool_name == "get_current_location":
                     tool_output = get_current_location.invoke(tool_args)
-                elif tool_name == "save_user_memory":
-                    print(f"LLM called save_user_memory with args: {tool_args}")
-                    fact = tool_args.get("fact", "")
-                    # Reject garbage facts that are too short or generic
-                    if len(fact.strip()) < 10 or fact.strip().lower() in ["the user", "the assistant", "user", "assistant"]:
-                        tool_output = f"Rejected: fact too short or generic: '{fact}'"
-                        print(f"[WARN] {tool_output}")
-                    else:
-                        try:
-                            from supabase import create_client, ClientOptions
-                            user_supabase = create_client(os.getenv("VITE_SUPABASE_URL"), os.getenv("VITE_SUPABASE_ANON_KEY"), options=ClientOptions(headers={"Authorization": f"Bearer {State['token']}"}))
-                            res = user_supabase.table("user_memory").select("facts").eq("user_id", State['user_id']).execute()
-                            existing_facts = res.data[0].get("facts", []) if res.data else []
-                            if existing_facts is None: existing_facts = []
-                            existing_facts.append(fact)
-                            
-                            if res.data:
-                                user_supabase.table("user_memory").update({"facts": existing_facts}).eq("user_id", State['user_id']).execute()
-                            else:
-                                user_supabase.table("user_memory").insert({"user_id": State['user_id'], "facts": existing_facts}).execute()
-                            tool_output = f"Successfully saved memory: {fact}"
-                            print(tool_output)
-                        except Exception as e:
-                            tool_output = f"Failed to save memory: {e}"
-                            print(tool_output)
                 else:
                     tool_output = "Unknown tool"
                     
@@ -141,11 +100,12 @@ def general_generation_node(State: GraphState):
             r'function\s*[:\(]',           # function:get_weather or function(
             r'get_weather',                 # raw tool name
             r'get_current_location',        # raw tool name
-            r'save_user_memory',            # raw tool name
             r'</?tool_call>',               # XML tool tags
             r'"name"\s*:\s*"get_',          # JSON tool format
             r'parameters\s*[:\{]',          # parameters: or parameters{
             r'\btool\s*call\b',             # "tool call"
+            r'function call',               # "function call"
+            r'specific function',           # "specific function"
         ]
         combined_pattern = '|'.join(tool_leak_patterns)
         if _re.search(combined_pattern, answer, _re.IGNORECASE):
@@ -277,7 +237,6 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
         return {"context": "", "router": 1}
 
     # 4. Rerank candidates using CrossEncoder
-    # Create question-candidate pairs using the raw natural language question
     cross_inp = [[state["question"], context] for context in candidates]
     scores = reranker.predict(cross_inp)
 
@@ -287,22 +246,24 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
         if "Uploaded Document Context:" in context:
             score += 5.0  # Massive priority boost for user's personal documents
         scored_candidates.append((context, score))
-        
-    scored_candidates = sorted(scored_candidates, key=lambda x: x[1], reverse=True)
-    
-    print("\n--- Cross Encoder Scores ---")
-    for doc, score in scored_candidates:
-        print(f"Score {score:.4f} | {doc[:80]}...")
-    print("----------------------------\n")
 
-    # Semantic Routing Logic: check if the best match is actually a good match
+    scored_candidates = sorted(scored_candidates, key=lambda x: x[1], reverse=True)
     best_score = scored_candidates[0][1]
+
+    # Semantic Routing Logic
     if best_score < -1.5:
+        # Score too low — route to general agent, no logging (not a FAQ hit)
         print(f"Semantic Router: Best score {best_score:.4f} < -1.5. Routing to General Agent.")
         return {"context": "", "router": 1}
 
+    # Score is good enough — log it to Loki
     print(f"Semantic Router: Best score {best_score:.4f} >= -1.5. Routing to Jio FAQ Agent.")
-    # Select the top 3 best matching candidates
+    logger.info(
+        f"[RERANK] question='{state['question'][:80]}' "
+        f"best_score={best_score:.4f} "
+        f"top_match='{scored_candidates[0][0][:80]}...'"
+    )
+
     top_candidates = [candidate for candidate, score in scored_candidates[:3]]
     
     retrieved_context = "\n".join(top_candidates) + "\n"
@@ -311,19 +272,14 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
 def generate_node(state:GraphState):
     question = state["question"]
     context = state["context"]
-    long_term_memory = state.get("long_term_memory", "")
-    system_prompt =f"""You are a helpful JIO customer support assistant. Unless specified otherwise in the LONG TERM MEMORY, your default name is Jio Assistant.
+    system_prompt =f"""You are a helpful JIO customer support assistant. Your default name is Jio Assistant.
     Use the provided CONTEXT to answer the user's question about Jio. 
-    
-    USER'S LONG TERM MEMORY (PRIORITIZE THESE FACTS ABOUT YOUR IDENTITY AND THE USER):
-    {long_term_memory}
     
     IMPORTANT INSTRUCTIONS:
     1. For questions about Jio services, plans, or FAQs, answer using ONLY the provided context.
-    2. If the user asks about personal details they shared earlier, or asks about your name/identity, you MUST use the long term memory and conversation history to answer them warmly.
-    3. Treat slight variations in spelling or spacing (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same thing.
-    4. If the context does not contain the answer to a Jio-related question, say you couldn't find information about that in the Jio FAQs.
-    5. Do not create new information or guess outside the context for Jio-related facts.
+    2. Treat slight variations in spelling or spacing (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same thing.
+    3. If the context does not contain the answer to a Jio-related question, say you couldn't find information about that in the Jio FAQs.
+    4. Do not create new information or guess outside the context for Jio-related facts.
     
     CONTEXT:
     {context}"""
@@ -336,3 +292,129 @@ def generate_node(state:GraphState):
     except Exception as e:
         print(f"NVIDIA API Error: {e}")
         return {"answer": "The AI service is currently experiencing high traffic (Queue Exceeded). Please wait a few moments and try your question again!"}
+
+import json
+from supabase import create_client, ClientOptions
+
+SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
+
+async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, token: str):
+    """
+    Evaluates the conversation in the background and saves to Supabase if necessary.
+    """
+    print("\n[MEMORY BACKGROUND] Evaluating conversation for long-term memory...")
+    
+    if not question:
+        return
+
+    NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
+    client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+    
+    system_prompt = """You are a Memory Evaluation Assistant.
+Your task is to analyze the user's question and the assistant's answer, and determine if there is any personal fact, preference, or long-term information about the user that should be remembered.
+Examples of things to remember: "I live in Mumbai", "My name is Aman", "My Jio number is 9876543210", "I like prepaid plans".
+Examples of things to IGNORE: "What is the weather?", "How to recharge?", "Hi", general chat.
+
+If there is something to remember, output a JSON object: {"save_memory": true, "memory_content": "User lives in Mumbai"}
+If there is nothing to remember, output: {"save_memory": false, "memory_content": ""}
+Do NOT output anything else except the JSON.
+"""
+
+    user_prompt = f"User Question: {question}\nAssistant Answer: {answer}"
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
+    
+    try:
+        response = await client.ainvoke(messages)
+        content = response.content.strip()
+        
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+            
+        result = json.loads(content)
+        save_memory = result.get("save_memory", False)
+        memory_content = result.get("memory_content", "")
+        
+        if save_memory and memory_content:
+            print(f"[MEMORY BACKGROUND] -> DECISION: SAVE TO LTM")
+            print(f"[MEMORY BACKGROUND] -> CONTENT: {memory_content}")
+            
+            print(f"\n[MEMORY BACKGROUND] Connecting to Supabase to store memory...")
+            if token:
+                user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+            else:
+                user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+                
+            user_supabase.table("user_memories").insert({
+                "user_id": user_id,
+                "memory_text": memory_content
+            }).execute()
+            
+            print(f"[MEMORY BACKGROUND] -> Successfully stored memory in Supabase.")
+        else:
+            print("[MEMORY BACKGROUND] -> DECISION: DO NOT SAVE")
+            
+    except Exception as e:
+        print(f"[MEMORY BACKGROUND] -> Error: {e}")
+        logger.error(f"[MEMORY BACKGROUND] Error: {e}")
+
+async def summarize_short_term_memory_bg(session_id: str):
+    """
+    Background task to summarize short term memory (LangGraph state) 
+    if it exceeds 5 messages, to prevent context bloat.
+    """
+    from app import workflow
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from langchain_core.messages import RemoveMessage, SystemMessage
+    
+    print(f"\n[STM SUMMARIZER] Checking session {session_id} for memory bloat...")
+    config = {"configurable": {"thread_id": session_id}}
+    
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        langgraph_app = workflow.compile(checkpointer=memory)
+        state = await langgraph_app.aget_state(config)
+        
+        if not state or not hasattr(state, "values") or "messages" not in state.values:
+            return
+            
+        messages = state.values["messages"]
+        if len(messages) <= 5:
+            print(f"[STM SUMMARIZER] Only {len(messages)} messages, skipping summary.")
+            return
+            
+        print(f"[STM SUMMARIZER] {len(messages)} messages found. Summarizing older messages...")
+        
+        messages_to_summarize = messages[:-2]
+        
+        convo_text = ""
+        for m in messages_to_summarize:
+            role = "User" if m.type == "human" else "AI"
+            convo_text += f"{role}: {m.content}\n"
+            
+        NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
+        client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+        
+        system_prompt = "Summarize the following conversation history concisely. Focus on the user's intent and any facts established. Do not add new information."
+        prompt = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Conversation:\n{convo_text}")
+        ]
+        
+        try:
+            response = await client.ainvoke(prompt)
+            summary = response.content.strip()
+            
+            delete_msgs = [RemoveMessage(id=m.id) for m in messages_to_summarize if m.id]
+            summary_msg = SystemMessage(content=f"[System Note: Summary of previous conversation]\n{summary}")
+            
+            await langgraph_app.aupdate_state(config, {"messages": delete_msgs + [summary_msg]})
+            print(f"[STM SUMMARIZER] Successfully summarized and pruned {len(messages_to_summarize)} messages.")
+            
+        except Exception as e:
+            print(f"[STM SUMMARIZER] Error summarizing: {e}")
+            logger.error(f"[STM SUMMARIZER] Error: {e}")

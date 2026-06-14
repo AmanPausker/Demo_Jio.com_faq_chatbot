@@ -1,125 +1,153 @@
 # Jio FAQ Chatbot
 
-An intelligent, context-aware FAQ assistant for Jio.com support queries. Combines a **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** via Cerebras (Llama 3.1 8B). Features **speech-to-text** and **text-to-speech** capabilities powered by Sarvam AI, all wrapped in a Gradio web UI.
+An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** (NVIDIA Llama 3.1 8B / Groq). Features **speech-to-text**, **text-to-speech** (Sarvam AI), **live video/audio chat** with vision understanding, **PDF ingestion** (Qdrant), **image generation**, and **persistent user memory** (Supabase). Served via FastAPI with a React + Vite web frontend and a React Native Expo mobile app.
+
+---
 
 ## Architecture
 
 ```
-User (Text or Audio)
-    |
-    v
-[Gradio UI]
-    |
-    +--- Text ----> retrieve_node()
-    |                   |
-    |               [Fuzzy Normalizer]
-    |               (jellyfish + difflib)
-    |                   |
-    |          +--------+--------+
-    |          |                 |
-    |     [Vector Search]   [Keyword + Fulltext]
-    |     (Neo4j, top 10)  (Neo4j Lucene, top 10)
-    |          |                 |
-    |          +--------+--------+
-    |                   |
-    |           [Graph Traversal]
-    |           (Topic -> Subtopic -> FAQ)
-    |                   |
-    |           [CrossEncoder Rerank]
-    |           (top 3 contexts)
-    |                   |
-    |             generate_node()
-    |                   |
-    |            [Cerebras Llama 3.1 8B]
-    |                   |
-    +--- Audio --------> listen_for_speech()
-    |                   (Sarvam STT)
-    |                   |
-    |              [Transcript]
-    |                   |
-    |              (same pipeline)
-    |
-    v
-[Answer] ----> generate_speech() (Sarvam TTS) ----> Audio playback
+┌─────────────────────────────────────────────────────────────┐
+│                    Clients                                   │
+│  ┌──────────────┐  ┌──────────────────┐  ┌───────────────┐  │
+│  │  React/Vite  │  │  React Native    │  │  Gradio       │  │
+│  │  Web App     │  │  Expo Mobile     │  │  (dev only)   │  │
+│  └──────┬───────┘  └────────┬─────────┘  └───────┬───────┘  │
+│         │                  │                     │          │
+└─────────┼──────────────────┼─────────────────────┼──────────┘
+          │ HTTP/REST + WS   │ HTTP + WS           │
+          ▼                  ▼                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  FastAPI Backend (server.py)                  │
+│                                                              │
+│  REST Endpoints:                WebSocket Endpoints:         │
+│  POST /api/chat                 WS /api/live/ws              │
+│  POST /api/chat/audio           WS /api/audio_stream/ws      │
+│  GET  /api/sessions                                            │
+│  GET  /api/sessions/{id}/history                               │
+│  DELETE /api/sessions/{id}                                     │
+│  POST /api/upload (PDF)                                        │
+│  GET  /api/memory                                              │
+│  POST /api/vision                                              │
+│  POST /api/generate_image                                      │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │  LangGraph Workflow (app.py → nodes.py)              │    │
+│  │                                                      │    │
+│  │  retrieve_node: Neo4j vector + fulltext → Qdrant    │    │
+│  │                → CrossEncoder rerank → route        │    │
+│  │  generate_node: NVIDIA Llama 3.1 8B (FAQ)           │    │
+│  │  general_generation_node: NVIDIA Llama 3.1 8B + tools│   │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────┬──────────┬──────────┬──────────┬──────────────────┘
+           │          │          │          │
+           ▼          ▼          ▼          ▼
+      Supabase     Neo4j      Qdrant     Sarvam AI
+      (Auth +     (FAQ       (User       (STT/TTS)
+       Memory)     Graph)     Docs)
 ```
 
-### LangGraph Workflow
-
-```mermaid
-graph TD
-    A["User Query"] --> B["GraphState"]
-    B --> C["retrieve_node()"]
-    C --> D["Embedding Generation"]
-    C --> E["Keyword Extraction"]
-    D --> G["Neo4j Vector Search"]
-    E --> H["Lucene Fulltext Search"]
-    G --> I["Hybrid Retrieval"]
-    H --> I
-    I --> J["Graph Traversal"]
-    J --> K["Candidate Contexts"]
-    K --> L["CrossEncoder Reranking"]
-    L --> M["Top 3 Retrieved FAQs"]
-    M --> N["generate_node()"]
-    N --> O["Cerebras LLM"]
-    O --> P["Final Response"]
-```
+---
 
 ## Features
 
-- **Hybrid Search Pipeline**: Vector similarity search (all-MiniLM-L6-v2 embeddings) combined with Lucene fulltext search for high precision and recall.
-- **Fuzzy Query Normalization**: Phonetic (jellyfish) and string-similarity (difflib) correction for ASR typos (e.g., "siggy" -> "Swiggy", "geo" -> "Jio").
-- **CrossEncoder Reranking**: ms-marco-MiniLM-L-6-v2 scores candidate contexts to surface the top 3 most relevant FAQs.
-- **Graph Traversal**: Neo4j Cypher queries walk `(Topic)-[:HAS_SUBTOPIC]->(Subtopic)-[:CONTAINS_FAQ]->(FAQ)` to build rich context strings.
-- **Speech-to-Text**: Real-time microphone streaming via Sarvam AI WebSocket API (saaras:v3, Hindi codemix).
-- **Text-to-Speech**: Asynchronous chunked TTS via Sarvam AI REST API (bulbul:v3) with proper WAV stitching.
-- **Latency Optimized**: End-to-end response time under 5 seconds (down from 60s).
-- **Gradio Web UI**: Accessible chat interface with audio recording and playback.
+### Core
+- **Hybrid RAG Pipeline** — Vector similarity (`all-MiniLM-L6-v2`) + Lucene fulltext search on Neo4j, reranked by CrossEncoder (`ms-marco-MiniLM-L-6-v2`)
+- **Dual LLM Architecture** — NVIDIA Llama 3.1 8B for LangGraph RAG pipeline; Groq Llama 3.1 8B for low-latency live streaming
+- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (NVIDIA Llama 3.2 11B), and streaming TTS
+- **Live Audio Chat** — Streaming WebSocket with Sarvam STT → RAG retrieval → Groq streaming LLM → parallel Sarvam TTS
+- **Long-Term Memory** — Persisted user facts in Supabase `user_memory` table, injected into every LLM call
+- **Short-Term Memory** — LangGraph checkpointing via SQLite (`checkpoints.db`) for conversation history per session
+
+### Multi-Modal
+- **Speech-to-Text** — Sarvam AI `saaras:v3` (Hinglish codemix, Silero VAD silence detection)
+- **Text-to-Speech** — Sarvam AI `bulbul:v3` streaming with sentence-boundary parallel fetching
+- **Vision (Upload)** — Analyze uploaded images via NVIDIA Llama 3.2 11B Vision
+- **Image Generation** — Cloudflare Workers AI Flux (text-to-image)
+- **PDF Ingestion** — Upload PDFs → Docling conversion → chunking → Qdrant vector storage → per-user retrieval
+
+### UI
+- **Web Frontend** — React + Vite with text, audio, voice, and live video modes
+- **Mobile App** — React Native Expo with camera preview, VAD barge-in, and TTS queue
+- **Gradio UI** — Standalone dev interface with audio recording and streaming playback
+- **A2UI Cards** — LLM can embed rich UI components (e.g., WeatherCard) in responses
+
+---
 
 ## Tech Stack
 
-| Layer              | Technology                                                                 |
-|--------------------|----------------------------------------------------------------------------|
-| Language           | Python 3.10+                                                               |
-| UI                 | Gradio                                                                     |
-| Agent Framework    | LangGraph, LangChain                                                       |
-| LLM                | Cerebras (Llama 3.1 8B)                                                    |
-| Vector Search      | Neo4j vector index + sentence-transformers (all-MiniLM-L6-v2)              |
-| Fulltext Search    | Neo4j Lucene fulltext index                                                |
-| Reranking          | CrossEncoder (ms-marco-MiniLM-L-6-v2)                                     |
-| Graph Database     | Neo4j (Docker)                                                             |
-| Speech-to-Text     | Sarvam AI WebSocket API (saaras:v3)                                        |
-| Text-to-Speech     | Sarvam AI REST API (bulbul:v3)                                             |
-| Fuzzy Matching     | jellyfish, difflib                                                         |
+| Layer | Technology |
+|---|---|
+| **Language** | Python 3.10+ |
+| **Backend Framework** | FastAPI + Uvicorn |
+| **Agent Framework** | LangGraph, LangChain |
+| **FAQ LLM** | NVIDIA Llama 3.1 8B (`meta/llama-3.1-8b-instruct`) |
+| **Streaming LLM** | Groq Llama 3.1 8B (`llama-3.1-8b-instant`) |
+| **Vision LLM** | NVIDIA Llama 3.2 11B (`meta/llama-3.2-11b-vision-instruct`) |
+| **Graph Database** | Neo4j (Docker, `bolt://localhost:7687`) |
+| **Vector Store (FAQ)** | Neo4j vector index (`faq_embeddings`) |
+| **Vector Store (Docs)** | Qdrant Cloud (`jio_documents` collection) |
+| **Embedding** | `all-MiniLM-L6-v2` (SentenceTransformers) |
+| **Reranking** | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| **STT** | Sarvam AI `saaras:v3` |
+| **TTS** | Sarvam AI `bulbul:v3` (speaker: `shubh`) |
+| **VAD** | Silero VAD |
+| **Auth + Memory** | Supabase (JWT, `user_memory`, `chat_sessions`) |
+| **Image Gen** | Cloudflare Workers AI (`@cf/black-forest-labs/flux-1-schnell`) |
+| **Checkpointing** | SQLite (`checkpoints.db`) via LangGraph `AsyncSqliteSaver` |
+| **Web Frontend** | React + Vite |
+| **Mobile** | React Native + Expo (SDK 54) |
+| **Dev UI** | Gradio |
+
+---
 
 ## Project Structure
 
 ```
-├── app.py                    # Main entry point (Gradio UI + LangGraph workflow)
-├── agent_state.py            # TypedDict graph state definition
-├── nodes.py                  # LangGraph nodes: retrieve_node, generate_node
-├── get_transcript.py         # Speech-to-Text via Sarvam AI streaming
-├── get_audio.py              # Text-to-Speech via Sarvam AI (async chunked)
-├── embed_faqs.py             # Generates & stores embeddings in Neo4j
-├── create_index.py           # Creates Neo4j fulltext index
-├── jio_faq_data.json         # Scraped FAQ data (topic, sub_topic, Q&A)
-├── topics.json               # Topic -> sub-topic hierarchy mapping
-├── profile_latency.py        # End-to-end latency profiling
-├── check_sarvam.py           # Sarvam TTS WebSocket test
-├── test_*.py                 # Unit/performance test scripts
-├── speech_to_text_demo/      # Standalone Sarvam AI demos
-│   ├── demo.py               # Batch STT job demo
-│   ├── demo_audio_streaming.py # Live mic streaming demo
-│   └── demo_tts.py           # TTS streaming demo
-└── .env                      # Environment variables (API keys)
+├── server.py              # FastAPI server (REST + WebSocket endpoints)
+├── app.py                 # LangGraph workflow definition + Gradio UI
+├── nodes.py               # LangGraph nodes (retrieve, generate, general)
+├── agent_state.py         # GraphState TypedDict
+├── tools.py               # LangChain tools (weather, location)
+├── get_transcript.py      # Sarvam STT (WebSocket streaming + REST)
+├── get_audio.py           # Sarvam TTS (async streaming)
+├── file_workflow.py       # PDF ingestion (Docling → Qdrant)
+├── clear_memory.py        # Utility to clear Supabase user_memory
+├── checkpoints.db         # SQLite LangGraph checkpoints
+│
+├── frontend/              # Web app (React + Vite)
+│   └── src/
+│       ├── App.jsx        # Main chat UI (all modes)
+│       ├── Auth.jsx       # Supabase login/signup
+│       ├── A2UICatalog.tsx # Weather card component
+│       ├── supabaseClient.js
+│       └── fillersData.js # Pre-generated TTS fillers
+│
+├── mobile_app/            # Mobile app (React Native + Expo)
+│   └── src/
+│       ├── app/(app)/
+│       │   ├── chat.tsx   # Text + voice chat screen
+│       │   └── live.tsx   # Live video chat screen
+│       └── services/
+│           └── api.ts     # API client
+│
+├── data/
+│   ├── jio_faq_data.json  # Scraped FAQ dataset
+│   └── topics.json        # Topic hierarchy
+│
+└── .env                   # API keys
 ```
+
+---
 
 ## Setup
 
 ### Prerequisites
 
 - Python 3.10+
+- Node.js 18+
 - [Docker](https://www.docker.com/) (for Neo4j)
-- API keys for Cerebras and Sarvam AI
+- [Expo Go](https://expo.dev/go) (for mobile development)
 
 ### 1. Clone & Virtual Environment
 
@@ -134,9 +162,7 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 ### 2. Install Dependencies
 
 ```bash
-pip install neo4j sentence-transformers langchain-cerebras langchain-core \
-            python-dotenv gradio langgraph langchain-community \
-            sounddevice numpy jellyfish
+pip install -r requirements.txt
 ```
 
 ### 3. Start Neo4j (Docker)
@@ -150,88 +176,142 @@ docker run -d --name neo4j -p 7687:7687 -p 7474:7474 \
   neo4j:latest
 ```
 
-Access Neo4j Browser at `http://localhost:7474` (credentials: `neo4j` / `password123`).
+Neo4j Browser: `http://localhost:7474` (`neo4j` / `password123`)
 
 ### 4. Environment Variables
 
-Create a `.env` file in the project root:
+Create `.env` in the project root:
 
 ```env
-CEREBRAS_API_KEY="your_cerebras_api_key_here"
-SARVAM_API_KEY="your_sarvam_api_key_here"
+# LLM Providers
+NVDIA_API_KEY="nvapi-..."
+GROQ_API_KEY="gsk_..."
+CEREBRAS_API_KEY="csk_..."
+
+# Sarvam AI (STT/TTS)
+SARVAM_API_KEY="..."
+
+# Supabase (Auth + Memory)
+VITE_SUPABASE_URL="https://..."
+VITE_SUPABASE_ANON_KEY="..."
+
+# Qdrant (PDF storage)
+QDRANT_URL="https://..."
+QDRANT_API_KEY="..."
+
+# Cloudflare (Image generation)
+CLOUDFARE_ACCOUNT_ID="..."
+WORKERS_API_KEY="..."
+
+# OpenWeather (Weather tool)
+OPEN_WEATHER_API_KEY="..."
 ```
 
-### 5. Build the Database
-
-Run in order:
+### 5. Seed the Database
 
 ```bash
-# (Optional) Load FAQ data into Neo4j graph
-python load_to_graph.py
-
-# Generate and store vector embeddings
-python embed_faqs.py
-
-# Create Lucene fulltext index
-python create_index.py
+python load_to_graph.py   # Load FAQ data into Neo4j
+python embed_faqs.py      # Generate vector embeddings
+python create_index.py    # Create Lucene fulltext index
 ```
 
-> **Note**: `jio_faq_data.json` is pre-populated with scraped FAQ data. If you need to re-scrape, use `python collection_data.py`.
-
-### 6. Run the Chatbot
+### 6. Run the Application
 
 ```bash
+# Backend
+uvicorn server:server --host 0.0.0.0 --port 8000
+
+# Web frontend (separate terminal)
+cd frontend && npm run dev
+
+# Mobile (separate terminal)
+cd mobile_app && npx expo start
+
+# Gradio dev UI (optional)
 python app.py
 ```
 
-Open the Gradio URL (default `http://localhost:7860`) in your browser.
+---
 
 ## Usage
 
-- **Text queries**: Type your question and press Enter.
-- **Audio queries**: Click the microphone button, speak, and stop. The audio is transcribed via Sarvam STT and processed through the same pipeline.
-- **Responses**: The answer is displayed as text and also played as speech (Sarvam TTS).
+### Web App
+Navigate to `http://localhost:5173` (Vite dev server).
 
-## Testing
+- **Text chat** — Type a message and press Enter
+- **Audio chat** — Hold-to-talk button → VAD auto-detection → Sarvam STT → LLM → TTS
+- **Voice mode** — Continuous voice chat with animated orb
+- **Live video** — Camera + mic streaming with real-time vision understanding
+- **PDF upload** — Drag-and-drop a PDF for Qdrant-based retrieval
+- **Image upload** — Upload for vision analysis
+- **Image generation** — Text prompt → Flux AI
+- **Session management** — Sidebar with chat history
 
-Test scripts are standalone Python files (no framework dependency):
+### Mobile App
+Scan the Expo QR code or run on a simulator.
+
+- **Text/voice chat** — `chat.tsx` with continuous VAD and push-to-talk
+- **Live video chat** — `live.tsx` with camera preview, TTS queue, and barge-in
+
+### API
 
 ```bash
-python test_neo4j_fuzzy.py     # Neo4j fulltext + fuzzy search
-python test_chunking.py        # Async chunked TTS stitching
-python test_chunking_wave.py   # Chunked TTS with WAV headers
-python test_models.py          # Sarvam v2 vs v3 TTS speed comparison
-python test_rest.py            # Sarvam REST TTS API latency
-python test_sarvam_latency.py  # End-to-end TTS latency
-python test_truncation.py      # Long text truncation behavior
-python check_sarvam.py         # Sarvam TTS WebSocket streaming
+# Text chat
+curl -X POST "http://localhost:8000/api/chat" \
+  -H "Authorization: Bearer <supabase_jwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "How do I recharge my Jio plan?", "session_id": "optional-uuid"}'
+
+# Audio chat
+curl -X POST "http://localhost:8000/api/chat/audio" \
+  -H "Authorization: Bearer <supabase_jwt>" \
+  -F "audio=@recording.wav" \
+  -F "session_id=optional-uuid"
+
+# WebSocket live video chat
+ws://localhost:8000/api/live/ws
+
+# WebSocket audio stream chat
+ws://localhost:8000/api/audio_stream/ws
 ```
 
-## Profiling
+---
 
-```bash
-python profile_latency.py
-```
+## Memory System
 
-Measures per-stage latency: retrieval (Neo4j + CrossEncoder), generation (Cerebras), TTS (Sarvam), and total end-to-end.
+| Tier | Storage | Scope | Persistence |
+|---|---|---|---|
+| **Long-term** | Supabase `user_memory` table | Cross-session user facts | Permanent (until cleared) |
+| **Short-term** | SQLite `checkpoints.db` | Per-session conversation history | Until session TTL / manual delete |
+| **Session** | In-memory `ConnectionManager` | Live video chat state | 600s TTL, lost on restart |
+
+---
 
 ## Data Pipeline
 
-1. **Extraction**: FAQ data is scraped from Jio.com's official support pages and compiled into `jio_faq_data.json`.
-2. **Graph Ingestion**: `load_to_graph.py` creates `Topic`, `Subtopic`, and `FAQ` nodes with `HAS_SUBTOPIC` and `CONTAINS_FAQ` relationships in Neo4j.
-3. **Embeddings**: `embed_faqs.py` generates vector embeddings using `all-MiniLM-L6-v2` (local, ~90MB) and stores them directly on Neo4j nodes.
-4. **Indexing**: `create_index.py` builds a Lucene fulltext index on FAQ `question` and `answer` fields.
+1. **FAQ Scraping** — `data/jio_faq_data.json` (200+ entries covering True 5G, Postpaid, International Roaming, Offers, Onboarding)
+2. **Graph Ingestion** — `load_to_graph.py` creates `Topic` → `Subtopic` → `FAQ` nodes in Neo4j
+3. **Embeddings** — `embed_faqs.py` generates vectors via `all-MiniLM-L6-v2` (~90MB local model)
+4. **Fulltext Index** — `create_index.py` builds Lucene index on FAQ `question` + `answer` fields
+5. **PDF Ingestion** — `POST /api/upload` → Docling → chunking (1000 chars, 200 overlap) → Qdrant
 
-## Intelligent Hybrid Search
+---
 
-The retrieval pipeline combines three complementary strategies:
+## Latency Goals
 
-1. **Vector Search**: Encodes the query with `all-MiniLM-L6-v2` and retrieves top 10 semantically similar FAQs from Neo4j's vector index.
-2. **Fulltext Search**: Extracts key phrases from the query (after stopword removal and brand expansion) and performs a Lucene `OR`-joined fulltext search for top 10 results.
-3. **Reranking**: Both result sets are merged, deduplicated, and scored by a CrossEncoder (`ms-marco-MiniLM-L-6-v2`). The top 3 contexts are passed to the LLM.
+| Stage | Target | Actual (typical) |
+|---|---|---|
+| STT | <1s | 300-800ms |
+| RAG Retrieval | <500ms | 300-800ms |
+| LLM first token (Groq) | <50ms | 30-80ms |
+| LLM first token (NVIDIA) | <1s | 500-2000ms |
+| Vision LLM | 2-4s | 2-4s |
+| TTS first chunk | <500ms | 300-800ms |
+| Total (FAQ text) | <5s | 2-5s |
+| Total (live video) | <7s | 3-7s |
 
-This ensures the LLM receives both semantically relevant and keyword-exact context — critical for niche or highly specific FAQ topics.
+---
 
 ## License
 
-This project is for demonstration purposes. All FAQ data belongs to Jio.com.
+This project is for demonstration purposes. FAQ data belongs to Jio.com.
