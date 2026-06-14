@@ -153,4 +153,3 @@ async def generate_speech_stream(text: str):
         result = await task
         if result:
             yield result
-

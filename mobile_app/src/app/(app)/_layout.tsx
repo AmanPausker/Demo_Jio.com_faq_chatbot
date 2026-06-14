@@ -1,7 +1,7 @@
 import { Drawer } from 'expo-router/drawer';
 import { View, Text, TouchableOpacity, StyleSheet, FlatList, Modal, ActivityIndicator, ScrollView } from 'react-native';
 import { useEffect, useState } from 'react';
-import { fetchSessions, fetchMemory } from '../../services/api';
+import { fetchSessions } from '../../services/api';
 import { Feather } from '@expo/vector-icons';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useDrawerStatus } from '@react-navigation/drawer';
@@ -12,8 +12,7 @@ function CustomDrawerContent(props: any) {
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
-  const [longTermMemory, setLongTermMemory] = useState('');
-  const [memoryLoading, setMemoryLoading] = useState(false);
+
 
   const router = useRouter();
   const params = useLocalSearchParams();
@@ -22,17 +21,11 @@ function CustomDrawerContent(props: any) {
 
   const handleOpenSettings = async () => {
     setSettingsVisible(true);
-    setMemoryLoading(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
       setUserId(session?.user?.email || 'N/A');
-      const memory = await fetchMemory();
-      setLongTermMemory(memory);
     } catch (err) {
       console.error(err);
-      setLongTermMemory('Failed to load memory.');
-    } finally {
-      setMemoryLoading(false);
     }
   };
 
@@ -132,16 +125,7 @@ function CustomDrawerContent(props: any) {
               <Text style={styles.modalText}>{userId || 'Loading...'}</Text>
             </View>
 
-            <Text style={styles.modalLabel}>Long-Term Memory</Text>
-            <View style={[styles.modalBox, { flex: 1, minHeight: 150 }]}>
-              {memoryLoading ? (
-                <ActivityIndicator color="#a855f7" />
-              ) : (
-                <ScrollView>
-                  <Text style={styles.modalText}>{longTermMemory}</Text>
-                </ScrollView>
-              )}
-            </View>
+
           </View>
         </View>
       </Modal>
