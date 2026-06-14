@@ -1,6 +1,6 @@
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { Audio } from 'expo-av';
+import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Feather } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
@@ -59,7 +59,7 @@ export default function LiveChatScreen() {
   // VAD logic
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSpeakingState = useRef(false);
-  const VOLUME_THRESHOLD = -20;
+  const VOLUME_THRESHOLD = -25;
   const SILENCE_MS_TO_STOP = 1500;
 
   // Setup permissions
@@ -181,6 +181,9 @@ export default function LiveChatScreen() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
       
       const { recording } = await Audio.Recording.createAsync(
@@ -266,33 +269,32 @@ export default function LiveChatScreen() {
 
   return (
     <View style={styles.container}>
-      <CameraView style={styles.camera} facing="back" ref={cameraRef}>
-        <View style={styles.overlay}>
-          <View style={styles.header}>
-            <TouchableOpacity onPress={() => router.replace('/chat')} style={styles.backBtn}>
-              <Feather name="arrow-left" size={24} color="#fff" />
-            </TouchableOpacity>
-            <Text style={styles.title}>Live Camera</Text>
-            <View style={styles.recordingDot} />
-          </View>
-          
-          <WaveAnimation type={waveType} />
-
-          <ScrollView 
-            style={styles.messagesScrollView} 
-            contentContainerStyle={styles.messagesContent}
-            ref={scrollViewRef}
-            onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
-          >
-            {messages.map((m, i) => (
-              <View key={i} style={styles.messageBox}>
-                <Text style={styles.messageLabel}>{m.role === 'user' ? 'YOU' : 'AI'}</Text>
-                <Text style={styles.messageText}>{m.text}</Text>
-              </View>
-            ))}
-          </ScrollView>
+      <CameraView style={styles.camera} facing="back" ref={cameraRef} />
+      <View style={[styles.overlay, StyleSheet.absoluteFillObject]}>
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => router.replace('/chat')} style={styles.backBtn}>
+            <Feather name="arrow-left" size={24} color="#fff" />
+          </TouchableOpacity>
+          <Text style={styles.title}>Live Camera</Text>
+          <View style={styles.recordingDot} />
         </View>
-      </CameraView>
+        
+        <WaveAnimation type={waveType} />
+
+        <ScrollView 
+          style={styles.messagesScrollView} 
+          contentContainerStyle={styles.messagesContent}
+          ref={scrollViewRef}
+          onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
+        >
+          {messages.map((m, i) => (
+            <View key={i} style={styles.messageBox}>
+              <Text style={styles.messageLabel}>{m.role === 'user' ? 'YOU' : 'AI'}</Text>
+              <Text style={styles.messageText}>{m.text}</Text>
+            </View>
+          ))}
+        </ScrollView>
+      </View>
     </View>
   );
 }

@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.141.177.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.35.102.132:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -15,9 +15,14 @@ const getHeaders = async () => {
 export const fetchSessions = async () => {
   try {
     const headers = await getHeaders();
+    if (!headers['Authorization']) return [];
     const response = await axios.get(`${API_URL}/api/sessions`, { headers });
     return response.data.sessions || [];
-  } catch (error) {
+  } catch (error: any) {
+    if (error.response?.status === 401) {
+      console.warn('Unauthorized: Failed to fetch sessions');
+      return [];
+    }
     console.error('Failed to fetch sessions:', error);
     return [];
   }
@@ -26,9 +31,14 @@ export const fetchSessions = async () => {
 export const loadSessionHistory = async (sessionId: string) => {
   try {
     const headers = await getHeaders();
+    if (!headers['Authorization']) return [];
     const response = await axios.get(`${API_URL}/api/sessions/${sessionId}/history`, { headers });
     return response.data.history || [];
-  } catch (error) {
+  } catch (error: any) {
+    if (error.response?.status === 401) {
+      console.warn('Unauthorized: Failed to load history');
+      return [];
+    }
     console.error('Failed to load history:', error);
     return [];
   }
@@ -128,13 +138,3 @@ export const generateImage = async (prompt: string) => {
   }
 };
 
-export const fetchMemory = async () => {
-  try {
-    const headers = await getHeaders();
-    const response = await axios.get(`${API_URL}/api/memory`, { headers });
-    return response.data.memory || 'No long-term memory stored yet.';
-  } catch (error) {
-    console.error('Failed to fetch memory:', error);
-    return 'Failed to load memory.';
-  }
-};

@@ -5,6 +5,8 @@ import numpy as np
 import base64 # sarvam websocket expects audio encoded as Base64 String
 from sarvamai import SarvamAI
 import os
+import threading
+import queue as thread_queue
 from dotenv import load_dotenv
 from silero_vad import load_silero_vad, VADIterator
 import torch # silero model runs on pyTorch tensors.
@@ -20,6 +22,147 @@ VAD_WINDOW = 512   # 32 ms — Silero VAD expects exactly 512 samples at 16kHz
 # therefore audio chunks are further divided into 32ms windows for VAD.
 _vad_model = load_silero_vad()
 print("Silero VAD model loaded.")
+
+
+class StreamingSTTSession:
+    """
+    Wraps Sarvam's synchronous streaming STT WebSocket in a background thread
+    so it can be driven from an asyncio event loop without blocking.
+
+    Usage:
+        async with StreamingSTTSession() as stt:
+            await stt.send_pcm(pcm_bytes)          # feed raw int16 PCM
+            partial = await stt.get_partial()      # latest partial transcript (non-blocking)
+            final   = await stt.finalize()         # flush and get final transcript
+    """
+
+    def __init__(self):
+        self._stt_ws = None
+        self._context_mgr = None
+        self._send_q: thread_queue.Queue = thread_queue.Queue()   # PCM bytes → sender thread
+        self._partial_q: asyncio.Queue = None                     # partials → async consumer
+        self._latest_partial: str = ""
+        self._final_transcript: str = ""
+        self._done_event = threading.Event()
+        self._loop = None
+        self._sender_thread: threading.Thread = None
+        self._receiver_thread: threading.Thread = None
+
+    async def __aenter__(self):
+        self._loop = asyncio.get_event_loop()
+        self._partial_q = asyncio.Queue()
+
+        # Open Sarvam streaming connection in a thread (synchronous context manager)
+        ready = threading.Event()
+        error_box = [None]
+
+        def _open():
+            try:
+                self._context_mgr = client.speech_to_text_streaming.connect(
+                    model="saaras:v3",
+                    language_code="en-IN",
+                    mode="codemix",
+                    high_vad_sensitivity=True,
+                )
+                self._stt_ws = self._context_mgr.__enter__()
+                ready.set()
+                # Start sender + receiver loops
+                self._run_sender()
+            except Exception as e:
+                error_box[0] = e
+                ready.set()
+
+        open_thread = threading.Thread(target=_open, daemon=True)
+        open_thread.start()
+        await asyncio.get_event_loop().run_in_executor(None, ready.wait)
+        if error_box[0]:
+            raise error_box[0]
+
+        # Receiver runs in its own thread
+        self._receiver_thread = threading.Thread(target=self._run_receiver, daemon=True)
+        self._receiver_thread.start()
+        return self
+
+    async def __aexit__(self, *_):
+        await self.finalize()
+        self._done_event.set()
+        # Signal sender to stop
+        self._send_q.put(None)
+        # Close the Sarvam context in a thread
+        if self._context_mgr and self._stt_ws:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._context_mgr.__exit__(None, None, None)
+                )
+            except Exception:
+                pass
+
+    def _run_sender(self):
+        """Pulls PCM bytes from _send_q and forwards to Sarvam STT WS."""
+        while not self._done_event.is_set():
+            try:
+                item = self._send_q.get(timeout=0.05)
+                if item is None:
+                    break
+                b64 = base64.b64encode(item).decode("utf-8")
+                self._stt_ws.transcribe(audio=b64)
+            except thread_queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[StreamingSTT] Sender error: {e}")
+                break
+
+    def _run_receiver(self):
+        """Reads partial transcripts from Sarvam STT WS and pushes to asyncio queue."""
+        while not self._done_event.is_set():
+            try:
+                response = self._stt_ws.recv()
+                if (
+                    getattr(response, "type", None) == "data"
+                    and response.data.transcript
+                ):
+                    text = response.data.transcript.strip()
+                    if text and text != self._latest_partial:
+                        self._latest_partial = text
+                        self._final_transcript = text
+                        # Thread-safe push to asyncio queue
+                        self._loop.call_soon_threadsafe(
+                            self._partial_q.put_nowait, text
+                        )
+            except Exception:
+                break
+
+    async def send_pcm(self, pcm_bytes: bytes):
+        """Feed raw int16 PCM bytes to the STT stream (non-blocking)."""
+        self._send_q.put(pcm_bytes)
+
+    async def get_partial(self) -> str | None:
+        """Return the latest partial transcript if available, else None."""
+        try:
+            return self._partial_q.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    async def drain_partials(self):
+        """Drain all pending partials and return the last one."""
+        last = None
+        while True:
+            try:
+                last = self._partial_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return last or self._latest_partial
+
+    async def finalize(self) -> str:
+        """
+        Signal end-of-speech to Sarvam, wait briefly for the final transcript,
+        then return it.
+        """
+        # Give the receiver a moment to flush remaining responses
+        await asyncio.sleep(0.15)
+        await self.drain_partials()
+        return self._final_transcript or self._latest_partial
+
 
 #Allows multiple tasks to run concurrently
 async def listen_for_speech(silence_timeout: float = 0.5) -> str: # returns final transcript string.

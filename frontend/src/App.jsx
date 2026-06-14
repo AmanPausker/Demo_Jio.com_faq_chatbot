@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { floatToWavBlob } from "./utils/audioUtils"
+import { getAECContext, connectMicToAEC, playTTSThroughAEC, disconnectAEC } from './utils/aecUtils';
 import { myCatalog } from './A2UICatalog';
 import { MessageProcessor } from '@a2ui/web_core/v0_9';
 import { A2uiSurface } from '@a2ui/react/v0_9';
@@ -119,8 +120,7 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(window.innerWidth >= 768);
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [longTermMemory, setLongTermMemory] = useState('');
-  const [memoryLoading, setMemoryLoading] = useState(false);
+
 
   const [messages, setMessages] = useState([
     { id: 1, role: 'bot', text: 'Hello! How can I help you today?' }
@@ -158,6 +158,9 @@ function App() {
   const ttsQueueRef = useRef([]);
   const isPlayingTTSRef = useRef(false);
   const streamingMsgIdRef = useRef(null); // tracks the live-streaming bot message
+  const aecCtxRef = useRef(null);              // shared AEC AudioContext
+  const currentTTSSourceRef = useRef(null);    // current AEC AudioBufferSourceNode (for barge-in)
+  const livePartialMsgIdRef = useRef(null);    // tracks the in-progress partial transcript bubble
 
   // Audio-stream WebSocket (for VAD audio mode)
   const audioStreamWsRef    = useRef(null);
@@ -168,8 +171,22 @@ function App() {
     if (isPlayingTTSRef.current || ttsQueueRef.current.length === 0) return;
     isPlayingTTSRef.current = true;
     const b64 = ttsQueueRef.current.shift();
+
+    // If we have an AEC context (live / audio mode), play through it so the
+    // worklet receives the reference signal. Otherwise fall back to <audio>.
+    if (aecCtxRef.current) {
+      playTTSThroughAEC(b64, aecCtxRef.current, () => {
+        currentTTSSourceRef.current = null;
+        isPlayingTTSRef.current = false;
+        processTTSQueue();
+      }).then(src => {
+        currentTTSSourceRef.current = src;
+      });
+      return;
+    }
+
+    // Fallback: plain <audio> element (text mode)
     if (!audioPlayerRef.current) return;
-    
     audioPlayerRef.current.src = `data:audio/wav;base64,${b64}`;
     audioPlayerRef.current.onended = () => {
       isPlayingTTSRef.current = false;
@@ -179,7 +196,7 @@ function App() {
       isPlayingTTSRef.current = false;
       processTTSQueue();
     };
-    audioPlayerRef.current.play().catch(e => {
+    audioPlayerRef.current.play().catch(() => {
       isPlayingTTSRef.current = false;
       processTTSQueue();
     });
@@ -199,7 +216,7 @@ function App() {
       setCameraStream(stream);
       if (videoRef.current) videoRef.current.srcObject = stream;
 
-      const socket = new WebSocket('ws://10.141.177.237:8000/api/live/ws');
+      const socket = new WebSocket('ws://10.35.102.132:8000/api/live/ws');
       socket.onopen = () => {
         socket.send(JSON.stringify({
           type: "auth",
@@ -243,11 +260,34 @@ function App() {
           appendTTSChunk(data.payload);
 
         } else if (data.type === "transcript") {
-          // Show user speech transcript as a user message
-          setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: data.payload }]);
+          // Finalise the partial bubble (or create a new one) with the confirmed transcript
+          if (livePartialMsgIdRef.current) {
+            const pid = livePartialMsgIdRef.current;
+            setMessages(prev => prev.map(m =>
+              m.id === pid ? { ...m, text: data.payload, partial: false } : m
+            ));
+            livePartialMsgIdRef.current = null;
+          } else {
+            setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: data.payload }]);
+          }
+
+        } else if (data.type === "partial_transcript") {
+          // Update or create the partial bubble as the user speaks
+          const text = data.payload;
+          if (!livePartialMsgIdRef.current) {
+            const id = crypto.randomUUID();
+            livePartialMsgIdRef.current = id;
+            setMessages(prev => [...prev, { id, role: 'user', text, partial: true }]);
+          } else {
+            const pid = livePartialMsgIdRef.current;
+            setMessages(prev => prev.map(m =>
+              m.id === pid ? { ...m, text } : m
+            ));
+          }
 
         } else if (data.type === "interrupt_ack") {
           // Barge-in: finalize any incomplete streaming bubble
+          livePartialMsgIdRef.current = null; // drop any in-progress partial transcript
           setMessages(prev => {
             const lastMsg = prev[prev.length - 1];
             if (lastMsg && lastMsg.streaming) {
@@ -258,9 +298,13 @@ function App() {
             return prev;
           });
           streamingMsgIdRef.current = null;
-          // Also flush TTS queue on interrupt
+          // Flush TTS queue and stop current AEC playback on interrupt
           ttsQueueRef.current = [];
           isPlayingTTSRef.current = false;
+          if (currentTTSSourceRef.current) {
+            try { currentTTSSourceRef.current.stop(); } catch (_) {}
+            currentTTSSourceRef.current = null;
+          }
           if (audioPlayerRef.current && !audioPlayerRef.current.paused) {
             audioPlayerRef.current.pause();
           }
@@ -273,11 +317,24 @@ function App() {
       };
       setWs(socket);
 
-      const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-      liveAudioContextRef.current = audioContext;
-      const source = audioContext.createMediaStreamSource(audioStream);
-      const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+      // ── AEC audio pipeline ──────────────────────────────────────────────
+      // Layer 1: native browser hints (OS-level AEC where supported)
+      const audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 16000,
+        }
+      });
+
+      // Layer 2: NLMS worklet AEC — mic routed through the worklet which
+      // also receives TTS playback as the reference signal
+      const aecCtx = await getAECContext();
+      aecCtxRef.current = aecCtx;
+      const aecOutput = connectMicToAEC(audioStream, aecCtx);
+
+      const processorNode = aecCtx.createScriptProcessor(4096, 1, 1);
 
       const encodePCM = (pcmData) => {
         const bytes = new Uint8Array(pcmData.buffer);
@@ -296,11 +353,14 @@ function App() {
         for (let i = 0; i < input.length; i++) {
           pcmData[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
         }
-        
         socket.send(JSON.stringify({ type: "audio_chunk", payload: encodePCM(pcmData) }));
       };
-      source.connect(processorNode);
-      processorNode.connect(audioContext.destination);
+
+      // AEC output → ScriptProcessor → destination (keeps graph alive)
+      aecOutput.connect(processorNode);
+      processorNode.connect(aecCtx.destination);
+      liveAudioContextRef.current = aecCtx;
+      // ── end AEC audio pipeline ──────────────────────────────────────────
 
       const captureFrame = async () => {
         if (!videoRef.current || socket.readyState !== WebSocket.OPEN) return;
@@ -384,6 +444,9 @@ function App() {
       frameIntervalRef.current = null;
     }
     if (videoRef.current) videoRef.current.srcObject = null;
+    // Tear down AEC worklet and shared AudioContext
+    disconnectAEC();
+    aecCtxRef.current = null;
     setLiveMode(false);
     setMode('text');
   };
@@ -394,7 +457,7 @@ function App() {
       audioStreamWsRef.current.close();
       audioStreamWsRef.current = null;
     }
-    const socket = new WebSocket('ws://10.141.177.237:8000/api/audio_stream/ws');
+    const socket = new WebSocket('ws://10.35.102.132:8000/api/audio_stream/ws');
     socket.onopen = () => {
       socket.send(JSON.stringify({ type: 'auth', payload: { token, session_id: sid } }));
       console.log('[AUDIO WS] Connected');
@@ -483,26 +546,12 @@ function App() {
 
   const handleOpenSettings = async () => {
     setShowSettingsModal(true);
-    if (!session?.access_token) return;
-    setMemoryLoading(true);
-    try {
-      const res = await fetch('http://10.141.177.237:8000/api/memory', {
-        headers: { 'Authorization': `Bearer ${session.access_token}` }
-      });
-      const data = await res.json();
-      setLongTermMemory(data.memory || 'No long-term memory stored yet.');
-    } catch (err) {
-      console.error(err);
-      setLongTermMemory('Failed to load memory.');
-    } finally {
-      setMemoryLoading(false);
-    }
   };
 
   const fetchSessions = async () => {
     if (!session?.access_token) return;
     try {
-      const res = await fetch('http://10.141.177.237:8000/api/sessions', {
+      const res = await fetch('http://10.35.102.132:8000/api/sessions', {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -533,7 +582,7 @@ function App() {
     e.stopPropagation();
     if (!session?.access_token) return;
     try {
-      await fetch(`http://10.141.177.237:8000/api/sessions/${sessionId}`, {
+      await fetch(`http://10.35.102.132:8000/api/sessions/${sessionId}`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
@@ -553,7 +602,7 @@ function App() {
     setMessages([{ id: crypto.randomUUID(), role: 'bot', text: 'Loading history...' }]);
     if (!session?.access_token) return;
     try {
-      const res = await fetch(`http://10.141.177.237:8000/api/sessions/${sessionId}/history`, {
+      const res = await fetch(`http://10.35.102.132:8000/api/sessions/${sessionId}/history`, {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -609,7 +658,7 @@ function App() {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const response = await fetch('http://10.141.177.237:8000/api/upload', {
+      const response = await fetch('http://10.35.102.132:8000/api/upload', {
         method: 'POST',
         body: formData,
       });
@@ -651,7 +700,7 @@ function App() {
     const formData = new FormData();
     formData.append("image", file);
     try {
-      const response = await fetch('http://10.141.177.237:8000/api/vision', {
+      const response = await fetch('http://10.35.102.132:8000/api/vision', {
         method: 'POST',
         body: formData
       });
@@ -722,7 +771,7 @@ function App() {
     setGeneratedImage(null);
     setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: `\uD83C\uDFA8 Create image: ${prompt}` }]);
     try {
-      const response = await fetch('http://10.141.177.237:8000/api/generate_image', {
+      const response = await fetch('http://10.35.102.132:8000/api/generate_image', {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
@@ -757,7 +806,7 @@ function App() {
     if (userMsg.text.startsWith('/imagine ')) {
       const prompt = userMsg.text.replace('/imagine ', '');
       try {
-        const response = await fetch('http://10.141.177.237:8000/api/generate_image', {
+        const response = await fetch('http://10.35.102.132:8000/api/generate_image', {
           method: "POST",
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt })
@@ -781,7 +830,7 @@ function App() {
       return;
     }
     try {
-      const response = await fetch('http://10.141.177.237:8000/api/chat', {
+      const response = await fetch('http://10.35.102.132:8000/api/chat', {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -804,6 +853,7 @@ function App() {
     }
   };
 
+  const sendAudioMessageRef = useRef(null);
   const sendAudioMessage = async (audioBlob) => {
     unlockAudio();
 
@@ -834,7 +884,7 @@ function App() {
     formData.append('audio', audioBlob, 'recording.wav');
     if (activeSessionId) formData.append('session_id', activeSessionId);
     try {
-      const response = await fetch('http://10.141.177.237:8000/api/chat/audio', {
+      const response = await fetch('http://10.35.102.132:8000/api/chat/audio', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${session?.access_token}` },
         body: formData
@@ -860,11 +910,18 @@ function App() {
       setIsLoading(false);
     }
   };
+  sendAudioMessageRef.current = sendAudioMessage;
 
   const startRecording = async () => {
     try {
       unlockAudio();
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -901,13 +958,24 @@ function App() {
     const startNativeVAD = async () => {
       try {
         setVadLoading(true);
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const source = audioContext.createMediaStreamSource(stream);
+        // Layer 1: native browser AEC/NS hints
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        });
+        // Layer 2: NLMS worklet AEC
+        audioContext = await getAECContext();
+        aecCtxRef.current = audioContext;
+        const aecOutput = connectMicToAEC(stream, audioContext);
+
         const analyser = audioContext.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.2;
-        source.connect(analyser);
+        // cleaned mic signal → analyser (for VAD volume detection)
+        aecOutput.connect(analyser);
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         let isSpeakingState = false;
         const VOLUME_THRESHOLD = 50;
@@ -917,10 +985,11 @@ function App() {
         const checkVolume = () => {
           if (!active) return;
           analyser.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-          const averageVolume = sum / dataArray.length;
-          if (averageVolume > VOLUME_THRESHOLD) {
+          let maxVolume = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            if (dataArray[i] > maxVolume) maxVolume = dataArray[i];
+          }
+          if (maxVolume > VOLUME_THRESHOLD) {
             if (silenceTimer) {
               clearTimeout(silenceTimer);
               silenceTimer = null;
@@ -941,7 +1010,7 @@ function App() {
                 };
                 mediaRecorder.onstop = async () => {
                   const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-                  await sendAudioMessage(audioBlob);
+                  if (sendAudioMessageRef.current) await sendAudioMessageRef.current(audioBlob);
                 };
                 mediaRecorder.start();
               } catch (err) {
@@ -983,6 +1052,9 @@ function App() {
       if (audioContext && audioContext.state !== 'closed') audioContext.close();
       if (rafId) cancelAnimationFrame(rafId);
       if (silenceTimer) clearTimeout(silenceTimer);
+      // Tear down AEC when leaving audio mode
+      disconnectAEC();
+      aecCtxRef.current = null;
     };
   }, [mode]);
 
@@ -1008,12 +1080,7 @@ function App() {
                 {session?.user?.email || 'N/A'}
               </div>
             </div>
-            <div>
-              <label style={{ display: 'block', marginBottom: '8px', color: 'var(--text-secondary)', fontWeight: 'bold' }}>Long-Term Memory</label>
-              <div style={{ padding: '12px', background: 'var(--surface-color)', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', minHeight: '100px', whiteSpace: 'pre-wrap' }}>
-                {memoryLoading ? 'Loading...' : longTermMemory}
-              </div>
-            </div>
+
           </div>
         </div>
       )}
@@ -1105,6 +1172,7 @@ function App() {
                 <span className="live-msg-text">
                   {m.text}
                   {m.streaming && <span className="streaming-cursor" />}
+                  {m.partial && <span className="streaming-cursor" />}
                 </span>
               </div>
             ))}

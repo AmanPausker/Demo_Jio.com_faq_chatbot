@@ -4,7 +4,7 @@ import {
   FlatList, KeyboardAvoidingView, Platform, Image, ActivityIndicator, Keyboard 
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Audio } from 'expo-av';
+import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
 import { useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { DrawerActions } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
@@ -111,7 +111,7 @@ export default function ChatScreen() {
   // VAD logic
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSpeakingState = useRef(false);
-  const VOLUME_THRESHOLD = -20; // dB threshold (increased from -35)
+  const VOLUME_THRESHOLD = -25; // dB threshold (increased to reduce background noise sensitivity)
   const SILENCE_MS_TO_STOP = 1500;
 
   // Animations
@@ -260,6 +260,9 @@ export default function ChatScreen() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
 
       const { recording } = await Audio.Recording.createAsync(
@@ -285,10 +288,10 @@ export default function ChatScreen() {
   };
 
   const handleMetering = (db: number) => {
-    if (!isPlayingRef.current) {
-      const scale = 1 + (Math.max(0, db + 60) / 60) * 0.4;
-      pulseAnim.value = withTiming(scale, { duration: 100, easing: Easing.linear });
-    }
+    if (isPlayingRef.current) return;
+
+    const scale = 1 + (Math.max(0, db + 60) / 60) * 0.4;
+    pulseAnim.value = withTiming(scale, { duration: 100, easing: Easing.linear });
 
     if (db > VOLUME_THRESHOLD) {
       if (silenceTimerRef.current) {
@@ -362,6 +365,9 @@ export default function ChatScreen() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
 
       const { recording } = await Audio.Recording.createAsync(
