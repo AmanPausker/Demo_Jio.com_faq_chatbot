@@ -4,7 +4,8 @@ import {
   FlatList, KeyboardAvoidingView, Platform, Image, ActivityIndicator, Keyboard 
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
+import { Audio } from 'expo-av';
+import { RTCPeerConnection, RTCSessionDescription, mediaDevices } from 'react-native-webrtc';
 import { useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { DrawerActions } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
@@ -31,6 +32,7 @@ export default function ChatScreen() {
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
   const [isPlusMenuOpen, setIsPlusMenuOpen] = useState(false);
   const [isKeyboardVisible, setKeyboardVisible] = useState(false);
   const params = useLocalSearchParams();
@@ -40,6 +42,7 @@ export default function ChatScreen() {
   useEffect(() => {
     if (params.sessionId) {
       setActiveSessionId(params.sessionId as string);
+      activeSessionIdRef.current = params.sessionId as string;
       loadHistory(params.sessionId as string);
     } else {
       handleNewChat();
@@ -108,10 +111,16 @@ export default function ChatScreen() {
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
 
+  // WebRTC refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<any>(null);
+  const audioLevelIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
   // VAD logic
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSpeakingState = useRef(false);
-  const VOLUME_THRESHOLD = -25; // dB threshold (increased to reduce background noise sensitivity)
+  const VOLUME_THRESHOLD = -25;
   const SILENCE_MS_TO_STOP = 1500;
 
   // Animations
@@ -157,15 +166,16 @@ export default function ChatScreen() {
   useEffect(() => {
     isVoiceModeRef.current = isVoiceMode;
     if (isVoiceMode) {
-      startVAD();
+      startWebRTC();
     } else {
-      stopRecording();
+      stopWebRTC();
     }
   }, [isVoiceMode]);
 
   const handleNewChat = () => {
     const newSessionId = generateUUID();
     setActiveSessionId(newSessionId);
+    activeSessionIdRef.current = newSessionId;
     setMessages([{ id: Date.now().toString(), role: 'bot', text: 'Hello! How can I help you today?' }]);
     setIsVoiceMode(false);
   };
@@ -225,133 +235,120 @@ export default function ChatScreen() {
     }
   };
 
-  const playAudioBase64 = async (base64String: string) => {
+  const startWebRTC = async () => {
     try {
-      if (soundRef.current) await soundRef.current.unloadAsync();
-      const { sound } = await Audio.Sound.createAsync({ uri: `data:audio/wav;base64,${base64String}` });
-      soundRef.current = sound;
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return;
       
-      sound.setOnPlaybackStatusUpdate((status: any) => {
-        if (status.didJustFinish) {
-          setIsPlaying(false);
-          isPlayingRef.current = false;
-        }
-      });
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://10.35.102.237:8000').replace('http', 'ws') + '/api/live/ws';
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
       
-      setIsPlaying(true);
-      isPlayingRef.current = true;
-      await sound.playAsync();
-    } catch (e) {
-      console.error('Playback error', e);
-      setIsPlaying(false);
-      isPlayingRef.current = false;
-    }
-  };
+      ws.onopen = async () => {
+        ws.send(JSON.stringify({
+          type: "auth",
+          payload: { token: session.access_token, session_id: activeSessionIdRef.current || params.sessionId }
+        }));
+        
+        const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pcRef.current = pc;
+        
+        const stream = await mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+        localStreamRef.current = stream;
+        
+        stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
+        
+        const offer = await pc.createOffer({});
+        await pc.setLocalDescription(offer);
 
-  const startVAD = async () => {
-    try {
-      if (recordingRef.current) {
-        try {
-          await recordingRef.current.stopAndUnloadAsync();
-        } catch (e) {}
-        recordingRef.current = null;
-      }
+        await new Promise<void>((resolve) => {
+           if (pc.iceGatheringState === 'complete') {
+               resolve();
+           } else {
+               const timeout = setTimeout(() => resolve(), 2000);
+               pc.onicegatheringstatechange = () => {
+                   if (pc.iceGatheringState === 'complete') {
+                       clearTimeout(timeout);
+                       resolve();
+                   }
+               };
+           }
+        });
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-      });
+        ws.send(JSON.stringify({ type: "webrtc_offer", payload: pc.localDescription }));
 
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-        (status) => {
-          if (status.metering) {
-            handleMetering(status.metering);
+      };
+      
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          if (data.type === 'webrtc_answer') {
+            pcRef.current?.setRemoteDescription(new RTCSessionDescription(data.payload));
+          } else if (data.type === 'assistant_response') {
+            setMessages(prev => [...prev, { role: 'bot', text: data.payload, id: Date.now().toString() }]);
+            setIsPlaying(true);
+            setTimeout(() => setIsPlaying(false), 4000);
+          } else if (data.type === 'transcript') {
+            setMessages(prev => [...prev, { role: 'user', text: `🎤 ${data.payload}`, id: Date.now().toString() }]);
+          } else if (data.type === 'user_speaking_start') {
+            setIsRecording(true);
+            isSpeakingState.current = true;
+          } else if (data.type === 'user_speaking_end') {
+            setIsRecording(false);
+            isSpeakingState.current = false;
           }
-          if (status.durationMillis && status.durationMillis > 28000) {
-            if (isSpeakingState.current) {
-              isSpeakingState.current = false;
-              handleSpeechEnd();
-            }
-          }
-        },
-        100 // polling interval
-      );
-      recordingRef.current = recording;
+        };
       
+      ws.onclose = () => {
+        console.log('WebRTC WebSocket closed');
+        stopWebRTC();
+      };
     } catch (err) {
-      console.error('Failed to start VAD recording', err);
+      console.error('Failed to start WebRTC', err);
     }
   };
 
-  const handleMetering = (db: number) => {
-    if (isPlayingRef.current) return;
-
-    const scale = 1 + (Math.max(0, db + 60) / 60) * 0.4;
-    pulseAnim.value = withTiming(scale, { duration: 100, easing: Easing.linear });
-
-    if (db > VOLUME_THRESHOLD) {
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
-      }
-      if (!isSpeakingState.current) {
-        isSpeakingState.current = true;
-        setIsRecording(true);
-        if (soundRef.current && isPlayingRef.current) {
-          soundRef.current.stopAsync().catch(() => {});
-          setIsPlaying(false);
-          isPlayingRef.current = false;
-        }
-      }
-    } else {
-      if (isSpeakingState.current && !silenceTimerRef.current) {
-        silenceTimerRef.current = setTimeout(() => {
-          isSpeakingState.current = false;
-          handleSpeechEnd();
-        }, SILENCE_MS_TO_STOP);
-      }
+  const handleInterrupt = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "interrupt" }));
     }
   };
 
-  const handleSpeechEnd = async () => {
-    setIsRecording(false);
-    if (!recordingRef.current) return;
-    try {
-      await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
-      recordingRef.current = null;
-      if (uri) await sendAudioToServer(uri, false);
-      
-      // Restart listening after sending
-      if (isVoiceModeRef.current) startVAD();
-    } catch (e) {
-      console.error('Stop recording error', e);
-    }
-  };
-
-  const stopRecording = async () => {
+  const stopWebRTC = () => {
     setIsRecording(false);
     isSpeakingState.current = false;
     cancelAnimation(pulseAnim);
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    if (soundRef.current) {
-      soundRef.current.stopAsync().catch(() => {});
-      setIsPlaying(false);
-      isPlayingRef.current = false;
+    if (audioLevelIntervalRef.current) clearInterval(audioLevelIntervalRef.current);
+    if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t: any) => t.stop());
+        localStreamRef.current = null;
     }
-    if (recordingRef.current) {
-      try {
-        await recordingRef.current.stopAndUnloadAsync();
-      } catch (e) {
-        // Ignore if already unloaded
-      }
-      recordingRef.current = null;
+    if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
     }
+    if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+    }
+    setIsPlaying(false);
+    isPlayingRef.current = false;
   };
+
+  // Drive the orb animation purely based on state instead of raw volume DB
+  useEffect(() => {
+    if (isRecording || isPlaying) {
+      pulseAnim.value = withRepeat(
+        withSequence(
+          withTiming(1.3, { duration: 400 }),
+          withTiming(1.0, { duration: 400 })
+        ),
+        -1,
+        true
+      );
+    } else {
+      pulseAnim.value = withTiming(1.0, { duration: 200 });
+    }
+  }, [isRecording, isPlaying]);
 
   const startVoiceMessage = async () => {
     try {
@@ -564,6 +561,13 @@ export default function ChatScreen() {
                 <Feather name="mic" size={44} color="#ffffff" />
               </LinearGradient>
             </View>
+
+            {isPlaying && (
+              <TouchableOpacity style={styles.interruptBtn} onPress={handleInterrupt}>
+                <Feather name="mic-off" size={24} color="#fff" />
+                <Text style={styles.interruptText}>Interrupt</Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       ) : (
@@ -803,6 +807,27 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.8,
     shadowRadius: 40,
     elevation: 10,
+  },
+  interruptBtn: {
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ef4444',
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 30,
+    marginTop: 40,
+    elevation: 5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 3,
+  },
+  interruptText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    marginLeft: 8,
+    fontSize: 16,
   },
   voiceOrb: {
     width: 120,

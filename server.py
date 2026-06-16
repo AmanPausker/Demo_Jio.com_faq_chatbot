@@ -17,10 +17,23 @@ import time
 import shutil
 from collections import deque
 import hashlib
+import fractions
+import numpy as np
+
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamTrack
+import av
 
 from logger import logger, live_logger
 
-server = FastAPI(title="Jio FAQ Bot API")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    manager.start_cleanup(ttl_seconds=600)
+    yield
+
+server = FastAPI(title="Jio FAQ Bot API", lifespan=lifespan)
 from app import workflow
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -47,7 +60,7 @@ def get_current_user(token: str = Depends(get_token)):
         user_response = supabase.auth.get_user(token)
         return user_response.user.id
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        logger.warning(f"Auth error in get_current_user: {repr(e)}"); raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
 server.add_middleware(
@@ -114,7 +127,7 @@ def process_a2ui_messages(answer: str):
                     }
                 ]
         except Exception as e:
-            print(f"JSON Parse Error: {e}")
+            logger.debug(f"JSON Parse Error: {e}")
 
     return new_answer, spoken_text, a2ui_msgs, surface_id
 
@@ -150,7 +163,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                     "title": title
                 }).execute()
             except Exception as e:
-                print(f"Failed to create session: {e}")
+                logger.debug(f"Failed to create session: {e}")
 
     if not user_message.strip():
         return {"text": "Please enter a message.", "audio_base64": None}
@@ -283,7 +296,7 @@ async def chat_audio(background_tasks: BackgroundTasks, audio: UploadFile = File
                     "title": title
                 }).execute()
             except Exception as e:
-                print(f"Failed to create session: {e}")
+                logger.debug(f"Failed to create session: {e}")
 
     initial_state = {
         "question": user_message,
@@ -354,6 +367,44 @@ kimi_vision_llm = ChatOpenAI(
 primary_llm = ChatGroq(model="llama-3.1-8b-instant", api_key=os.getenv("GROQ_API_KEY"), streaming=True)
 
 
+class TTSAudioTrack(MediaStreamTrack):
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._queue = asyncio.Queue()
+        self._pts = 0
+
+    async def add_audio(self, wav_bytes: bytes):
+        import io
+        try:
+            container = av.open(io.BytesIO(wav_bytes))
+            resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+            for frame in container.decode(audio=0):
+                resampled = resampler.resample(frame)
+                for r_frame in resampled:
+                    await self._queue.put(r_frame.planes[0].to_bytes())
+        except Exception as e:
+            logger.debug(f"Failed to decode TTS audio for WebRTC: {e}")
+
+    async def recv(self):
+        try:
+            pcm_data = await asyncio.wait_for(self._queue.get(), timeout=0.02)
+        except asyncio.TimeoutError:
+            samples = 16000 * 20 // 1000
+            pcm_data = b'\x00' * (samples * 2)
+
+        samples = len(pcm_data) // 2
+        frame = av.AudioFrame(format='s16', layout='mono', samples=samples)
+        frame.sample_rate = 16000
+        frame.planes[0].update(pcm_data)
+        
+        frame.pts = self._pts
+        frame.time_base = fractions.Fraction(1, 16000)
+        self._pts += samples
+        return frame
+
+
 class Session:
     def __init__(self, session_id: str, user_id: str):
         self.session_id = session_id
@@ -384,6 +435,10 @@ class Session:
         self.is_analyzing_vision: bool = False
         self.last_analysis_time: float = 0
 
+        # WebRTC
+        self.pc: RTCPeerConnection | None = None
+        self.tts_track: TTSAudioTrack | None = None
+
     def touch(self):
         self.last_activity_time = time.time()
 
@@ -409,7 +464,7 @@ class ConnectionManager:
                 for sid in stale:
                     del self.sessions[sid]
                 if stale:
-                    print(f"[Cleanup] Removed {len(stale)} stale sessions")
+                    logger.debug(f"[Cleanup] Removed {len(stale)} stale sessions")
         self._cleanup_task = asyncio.create_task(_cleanup())
 
 
@@ -449,9 +504,9 @@ async def fetch_tts_sentence(text: str) -> str | None:
                     return data["audios"][0]
             else:
                 err_text = await resp.text()
-                print(f"TTS API error {resp.status} for: '{text[:40]}' - Reason: {err_text}")
+                logger.debug(f"TTS API error {resp.status} for: '{text[:40]}' - Reason: {err_text}")
     except Exception as e:
-        print(f"TTS sentence error: {e}")
+        logger.debug(f"TTS sentence error: {e}")
     return None
 
 
@@ -511,13 +566,24 @@ def needs_visual_context(question: str) -> bool:
     return False
 
 
-def build_live_prompt(session: Session, question: str) -> str:
-    parts = [
-        "You are a live visual assistant. You can see through the user's camera. "
-        "Answer naturally and conversationally. Be concise."
-    ]
-    parts.append(f"Q: {question}")
-    return "\n".join(parts)
+def build_live_prompt(session: Session, question: str, context: str = "") -> str:
+    if context:
+        return (
+            "You are a helpful live voice assistant for Jio. Your default name is Jio Assistant. "
+            "Use the provided CONTEXT to answer the user's question about Jio. "
+            "IMPORTANT INSTRUCTIONS:\n"
+            "1. For questions about Jio services, plans, or FAQs, answer using ONLY the provided context.\n"
+            "2. If the context does not contain the answer, say you couldn't find information about that in the Jio FAQs.\n"
+            "3. Answer naturally and conversationally. Be concise.\n\n"
+            f"CONTEXT:\n{context}\n\n"
+            f"Q: {question}"
+        )
+    else:
+        return (
+            "You are a live voice/visual assistant. You can see through the user's camera if they are in camera mode. "
+            "Answer naturally and conversationally. Be concise.\n\n"
+            f"Q: {question}"
+        )
 
 
 async def _send_tts_filler(websocket: WebSocket, text: str):
@@ -545,7 +611,19 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     session.conversation_history.append({"role": "user", "content": question})
 
     needs_vision = needs_visual_context(question)
-    prompt_text = build_live_prompt(session, question)
+    
+    # 1. Fetch Retrieval Context from Neo4j/Qdrant
+    from nodes import retrieve_node
+    state = {"question": question, "user_id": session.user_id, "messages": []}
+    config = {"configurable": {"thread_id": session.session_id}}
+    try:
+        retrieval_res = await asyncio.to_thread(retrieve_node, state, config)
+        retrieved_context = retrieval_res.get("context", "")
+    except Exception as e:
+        logger.debug(f"Live retrieval error: {e}")
+        retrieved_context = ""
+
+    prompt_text = build_live_prompt(session, question, retrieved_context)
 
     try:
         messages = []
@@ -566,7 +644,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                 img.save(out_io, format='JPEG', quality=85)
                 latest_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
             except Exception as resize_err:
-                print(f"Image resize error: {resize_err}")
+                logger.debug(f"Image resize error: {resize_err}")
 
             import random
             asyncio.create_task(_send_tts_filler(websocket, random.choice(_FILLER_PHRASES)))
@@ -580,14 +658,14 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                 vis_resp = await asyncio.wait_for(kimi_vision_llm.ainvoke([vision_msg]), timeout=7.0)
                 visual_desc = vis_resp.content.strip()
                 vision_latency = (time.time() - t_vision) * 1000
-                print(f"[LATENCY] Vision LLM took {vision_latency:.0f}ms")
+                logger.debug(f"[LATENCY] Vision LLM took {vision_latency:.0f}ms")
                 live_logger.info(
                     f"[VISION] user={session.user_id} session={session.session_id} "
                     f"latency_ms={vision_latency:.0f} "
                     f"response='{visual_desc[:200]}'"
                 )
             except Exception as e:
-                print(f"Vision error type: {type(e)}, error: {repr(e)}")
+                logger.debug(f"Vision error type: {type(e)}, error: {repr(e)}")
                 live_logger.error(
                     f"[VISION] FAILED: user={session.user_id} session={session.session_id} "
                     f"error='{repr(e)}'"
@@ -623,7 +701,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             try:
                 async for chunk in primary_llm.astream(messages):
                     if not session.is_processing:
-                        print("[STREAM] LLM interrupted by barge-in.")
+                        logger.debug("[STREAM] LLM interrupted by barge-in.")
                         break
                     token = chunk.content
                     if not token:
@@ -631,7 +709,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                     full_answer += token
                     sentence_buffer += token
                     if first_token:
-                        print(f"[LATENCY] LLM first token: {(time.time() - t_llm)*1000:.0f}ms")
+                        logger.debug(f"[LATENCY] LLM first token: {(time.time() - t_llm)*1000:.0f}ms")
                         first_token = False
                     try:
                         await websocket.send_json({"type": "text_chunk", "payload": token})
@@ -642,9 +720,9 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                         task = asyncio.create_task(fetch_tts_sentence(stripped))
                         await tts_queue.put(task)
                         sentence_buffer = ""
-                print(f"[LATENCY] LLM streaming done: {(time.time() - t_llm)*1000:.0f}ms | chars={len(full_answer)}")
+                logger.debug(f"[LATENCY] LLM streaming done: {(time.time() - t_llm)*1000:.0f}ms | chars={len(full_answer)}")
             except Exception as e:
-                print(f"[STREAM] LLM streaming error: {e}")
+                logger.debug(f"[STREAM] LLM streaming error: {e}")
             finally:
                 if sentence_buffer.strip() and session.is_processing:
                     task = asyncio.create_task(fetch_tts_sentence(sentence_buffer.strip()))
@@ -666,13 +744,18 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                     audio_b64 = await task
                     if audio_b64:
                         if first_chunk:
-                            print(f"[LATENCY] TTS first chunk: {(time.time() - t_tts)*1000:.0f}ms")
+                            logger.debug(f"[LATENCY] TTS first chunk: {(time.time() - t_tts)*1000:.0f}ms")
                             first_chunk = False
-                        await websocket.send_json({"type": "tts_chunk", "payload": audio_b64})
+                        if hasattr(session, "tts_track") and session.tts_track:
+                            import base64
+                            wav_bytes = base64.b64decode(audio_b64)
+                            await session.tts_track.add_audio(wav_bytes)
+                        else:
+                            await websocket.send_json({"type": "tts_chunk", "payload": audio_b64})
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    print(f"[STREAM] TTS consumer error: {e}")
+                    logger.debug(f"[STREAM] TTS consumer error: {e}")
 
         await asyncio.gather(llm_producer(), tts_consumer())
 
@@ -689,12 +772,12 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
         try:
             await websocket.send_json({"type": "assistant_response", "payload": answer})
         except Exception as ws_err:
-            print(f"WebSocket send error (assistant_response): {ws_err}")
+            logger.debug(f"WebSocket send error (assistant_response): {ws_err}")
 
-        print(f"[LATENCY] Total question→done: {(time.time() - t_start)*1000:.0f}ms")
+        logger.debug(f"[LATENCY] Total question→done: {(time.time() - t_start)*1000:.0f}ms")
 
     except Exception as e:
-        print(f"Error handling question: {e}")
+        logger.debug(f"Error handling question: {e}")
         try:
             await websocket.send_json({"type": "error", "payload": "Failed to generate response"})
         except Exception:
@@ -708,6 +791,53 @@ import numpy as np
 from get_transcript import transcribe_pcm, _vad_model, VADIterator, SAMPLE_RATE, VAD_WINDOW, StreamingSTTSession
 
 
+async def finalize_transcript(session: Session, websocket: WebSocket):
+    audio_data = bytes(session.audio_buffer)
+    session.audio_buffer = bytearray()
+    
+    if len(audio_data) == 0:
+        return
+
+    buffer_duration_ms = len(audio_data) / (SAMPLE_RATE * 2) * 1000
+    logger.debug(f"[LATENCY] Speech ended. Buffer: {buffer_duration_ms:.0f}ms of audio")
+
+    try:
+        t_stt_start = time.time()
+
+        # ── Finalise the streaming STT session → get final transcript ──
+        if session.stt_session is not None:
+            transcript = await session.stt_session.finalize()
+            await session.stt_session.__aexit__(None, None, None)
+            session.stt_session = None
+        else:
+            # Fallback: REST transcription if streaming session was never opened
+            transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
+
+        t_stt_end = time.time()
+        logger.debug(f"[LATENCY] STT took {(t_stt_end - t_stt_start)*1000:.0f}ms")
+
+        if transcript and transcript.strip():
+            transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
+            await websocket.send_json({"type": "transcript", "payload": transcript})
+            asyncio.create_task(handle_user_question(session, transcript, websocket))
+        else:
+            # Nothing recognised — close current STT session cleanly if still open
+            if session.stt_session is not None:
+                try:
+                    await session.stt_session.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                session.stt_session = None
+
+    except Exception as e:
+        logger.debug(f"STT Error in live chunk: {e}")
+        if session.stt_session is not None:
+            try:
+                await session.stt_session.__aexit__(None, None, None)
+            except Exception:
+                pass
+            session.stt_session = None
+
 async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket: WebSocket):
     pcm_bytes = base64.b64decode(audio_chunk_b64)
     session.audio_buffer.extend(pcm_bytes)
@@ -717,7 +847,7 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
             _vad_model,
             threshold=0.5,
             sampling_rate=SAMPLE_RATE,
-            min_silence_duration_ms=1000,
+            min_silence_duration_ms=600,
         )
 
     samples = (np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0).tolist()
@@ -734,7 +864,7 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
             await stt.__aenter__()
             session.stt_session = stt
         except Exception as e:
-            print(f"[StreamingSTT] Failed to open session: {e}")
+            logger.debug(f"[StreamingSTT] Failed to open session: {e}")
 
     # Feed PCM to Sarvam streaming STT
     if session.stt_session is not None:
@@ -755,58 +885,48 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
         result = session.vad_iterator(window)
         if result:
             if "start" in result:
-                # Barge-in: cancel ongoing generation/TTS
+                logger.info(f"[VAD] Speech started")
                 session.is_processing = False
                 try:
                     await websocket.send_json({"type": "interrupt_ack"})
+                    await websocket.send_json({"type": "user_speaking_start"})
                 except Exception:
                     pass
             if "end" in result:
+                logger.info(f"[VAD] Speech ended")
                 speech_ended = True
-
-    if speech_ended:
-        audio_data = bytes(session.audio_buffer)
-        session.audio_buffer = bytearray()
-        buffer_duration_ms = len(audio_data) / (SAMPLE_RATE * 2) * 1000
-        print(f"[LATENCY] Speech ended. Buffer: {buffer_duration_ms:.0f}ms of audio")
-
-        try:
-            t_stt_start = time.time()
-
-            # ── Finalise the streaming STT session → get final transcript ──
-            if session.stt_session is not None:
-                transcript = await session.stt_session.finalize()
-                await session.stt_session.__aexit__(None, None, None)
-                session.stt_session = None
-            else:
-                # Fallback: REST transcription if streaming session was never opened
-                transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
-
-            t_stt_end = time.time()
-            print(f"[LATENCY] STT took {(t_stt_end - t_stt_start)*1000:.0f}ms")
-
-            if transcript and transcript.strip():
-                transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
-                await websocket.send_json({"type": "transcript", "payload": transcript})
-                asyncio.create_task(handle_user_question(session, transcript, websocket))
-            else:
-                # Nothing recognised — close current STT session cleanly if still open
-                if session.stt_session is not None:
-                    try:
-                        await session.stt_session.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                    session.stt_session = None
-
-        except Exception as e:
-            print(f"STT Error in live chunk: {e}")
-            if session.stt_session is not None:
                 try:
-                    await session.stt_session.__aexit__(None, None, None)
+                    await websocket.send_json({"type": "user_speaking_end"})
                 except Exception:
                     pass
-                session.stt_session = None
 
+    if speech_ended:
+        await finalize_transcript(session, websocket)
+
+
+async def handle_incoming_track(session: Session, track, websocket: WebSocket):
+    logger.info(f"[WebRTC] Incoming track received: {track.kind}")
+    resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+    frame_count = 0
+    while True:
+        try:
+            frame = await track.recv()
+            frame_count += 1
+            resampled_frames = resampler.resample(frame)
+            for r_frame in resampled_frames:
+                pcm_bytes = r_frame.to_ndarray().tobytes()
+                
+                # Log max volume occasionally to verify audio isn't completely silent
+                if frame_count % 50 == 0:
+                    arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+                    if len(arr) > 0:
+                        logger.info(f"[WebRTC] Audio frame max volume: {np.max(np.abs(arr))} / 32768")
+
+                b64_pcm = base64.b64encode(pcm_bytes).decode('utf-8')
+                await process_audio_chunk(session, b64_pcm, websocket)
+        except Exception as e:
+            logger.error(f"[WebRTC] track ended with error: {e}")
+            break
 
 @server.websocket("/api/live/ws")
 async def live_chat_websocket(websocket: WebSocket):
@@ -852,12 +972,12 @@ async def live_chat_websocket(websocket: WebSocket):
                         )
                         pcm_data, stderr = await proc.communicate(file_bytes)
                         if proc.returncode != 0:
-                            print(f"ffmpeg error: {stderr.decode()[:200]}")
+                            logger.debug(f"ffmpeg error: {stderr.decode()[:200]}")
                             continue
                         b64_pcm = base64.b64encode(pcm_data).decode('utf-8')
                         await process_audio_chunk(session, b64_pcm, websocket)
                     except Exception as e:
-                        print(f"Error decoding audio_file: {e}")
+                        logger.debug(f"Error decoding audio_file: {e}")
 
                 elif event_type == "audio_file_full":
                     try:
@@ -868,7 +988,7 @@ async def live_chat_websocket(websocket: WebSocket):
                             await websocket.send_json({"type": "transcript", "payload": transcript})
                             asyncio.create_task(handle_user_question(session, transcript, websocket))
                     except Exception as e:
-                        print(f"Error processing audio_file_full: {e}")
+                        logger.debug(f"Error processing audio_file_full: {e}")
 
                 elif event_type == "video_frame":
                     session.frame_buffer.append(payload)
@@ -880,6 +1000,32 @@ async def live_chat_websocket(websocket: WebSocket):
                 elif event_type == "interrupt":
                     session.is_processing = False
                     await websocket.send_json({"type": "interrupt_ack"})
+
+                elif event_type == "speech_ended":
+                    await finalize_transcript(session, websocket)
+
+                elif event_type == "webrtc_offer":
+                    if session.pc is None:
+                        session.pc = RTCPeerConnection()
+                        session.tts_track = TTSAudioTrack()
+                        session.pc.addTrack(session.tts_track)
+
+                        @session.pc.on("track")
+                        def on_track(track):
+                            if track.kind == "audio":
+                                asyncio.create_task(handle_incoming_track(session, track, websocket))
+
+                    offer = RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
+                    await session.pc.setRemoteDescription(offer)
+                    answer = await session.pc.createAnswer()
+                    await session.pc.setLocalDescription(answer)
+                    await websocket.send_json({
+                        "type": "webrtc_answer",
+                        "payload": {
+                            "sdp": session.pc.localDescription.sdp,
+                            "type": session.pc.localDescription.type
+                        }
+                    })
 
         except WebSocketDisconnect:
             live_logger.info(f"[LIVE WS] Disconnected: user={user_id} session={session_id}")
@@ -943,7 +1089,7 @@ async def audio_stream_websocket(websocket: WebSocket):
                 continue
 
             transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript or "")
-            print(f"[LATENCY] STT: {(time.time()-t0)*1000:.0f}ms → '{transcript}'")
+            logger.debug(f"[LATENCY] STT: {(time.time()-t0)*1000:.0f}ms → '{transcript}'")
             logger.info(f"[AUDIO WS] STT: user={user_id} duration_ms={(time.time()-t0)*1000:.0f} transcript='{transcript[:60]}'")
 
             if not transcript.strip():
@@ -967,7 +1113,7 @@ async def audio_stream_websocket(websocket: WebSocket):
             )
             context = retrieval_result.get("context", "")
             router = retrieval_result.get("router", 1)
-            print(f"[LATENCY] Retrieval: {(time.time()-t_ret)*1000:.0f}ms, router={router}")
+            logger.debug(f"[LATENCY] Retrieval: {(time.time()-t_ret)*1000:.0f}ms, router={router}")
 
             full_answer = ""
             SENTENCE_ENDINGS = {'.', '!', '?'}
@@ -1004,7 +1150,7 @@ async def audio_stream_websocket(websocket: WebSocket):
                             full_answer += tok
                             buf += tok
                             if first:
-                                print(f"[LATENCY] LLM first token: {(time.time()-t_llm)*1000:.0f}ms")
+                                logger.debug(f"[LATENCY] LLM first token: {(time.time()-t_llm)*1000:.0f}ms")
                                 first = False
                             try:
                                 await websocket.send_json({"type": "text_chunk", "payload": tok})
@@ -1014,13 +1160,13 @@ async def audio_stream_websocket(websocket: WebSocket):
                             if s and s[-1] in SENTENCE_ENDINGS and len(s) >= MIN_SENTENCE_LEN:
                                 await tts_q.put(asyncio.create_task(fetch_tts_sentence(s)))
                                 buf = ""
-                        print(f"[LATENCY] LLM done: {(time.time()-t_llm)*1000:.0f}ms")
+                        logger.debug(f"[LATENCY] LLM done: {(time.time()-t_llm)*1000:.0f}ms")
                         try:
                             await websocket.send_json({"type": "assistant_response", "payload": full_answer})
                         except Exception:
                             pass
                     except Exception as e:
-                        print(f"[AUDIO WS] LLM error: {e}")
+                        logger.debug(f"[AUDIO WS] LLM error: {e}")
                     finally:
                         if buf.strip():
                             await tts_q.put(asyncio.create_task(fetch_tts_sentence(buf.strip())))
@@ -1037,11 +1183,11 @@ async def audio_stream_websocket(websocket: WebSocket):
                             b64 = await task
                             if b64:
                                 if first:
-                                    print(f"[LATENCY] TTS first chunk: {(time.time()-t_tts)*1000:.0f}ms")
+                                    logger.debug(f"[LATENCY] TTS first chunk: {(time.time()-t_tts)*1000:.0f}ms")
                                     first = False
                                 await websocket.send_json({"type": "tts_chunk", "payload": b64})
                         except Exception as e:
-                            print(f"[AUDIO WS] TTS err: {e}")
+                            logger.debug(f"[AUDIO WS] TTS err: {e}")
 
                 await asyncio.gather(faq_llm_producer(), faq_tts_consumer())
 
@@ -1055,7 +1201,7 @@ async def audio_stream_websocket(websocket: WebSocket):
                     None, lambda: general_generation_node(gen_state)
                 )
                 full_answer = gen_result.get("answer", "I'm having trouble right now.")
-                print(f"[LATENCY] General LLM: {(time.time()-t_gen)*1000:.0f}ms")
+                logger.debug(f"[LATENCY] General LLM: {(time.time()-t_gen)*1000:.0f}ms")
 
                 await websocket.send_json({"type": "assistant_response", "payload": full_answer})
 
@@ -1070,11 +1216,11 @@ async def audio_stream_websocket(websocket: WebSocket):
                     b64 = await task
                     if b64:
                         if first:
-                            print(f"[LATENCY] TTS first (general): {(time.time()-t_tts)*1000:.0f}ms")
+                            logger.debug(f"[LATENCY] TTS first (general): {(time.time()-t_tts)*1000:.0f}ms")
                             first = False
                         await websocket.send_json({"type": "tts_chunk", "payload": b64})
 
-            print(f"[LATENCY] Total: {(time.time()-t0)*1000:.0f}ms")
+            logger.debug(f"[LATENCY] Total: {(time.time()-t0)*1000:.0f}ms")
             logger.info(f"[AUDIO WS] Turn complete: user={user_id} total_ms={(time.time()-t0)*1000:.0f} answer_len={len(full_answer)}")
 
     except WebSocketDisconnect:
@@ -1087,11 +1233,9 @@ async def audio_stream_websocket(websocket: WebSocket):
             pass
 
 
-@server.on_event("startup")
-async def startup():
-    manager.start_cleanup(ttl_seconds=600)
+# Startup is now handled by the lifespan context manager
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("server:server", host="0.0.0.0", port=8000, reload=False, log_level="warning", access_log=False)

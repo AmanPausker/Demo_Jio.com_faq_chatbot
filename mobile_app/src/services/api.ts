@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.35.102.132:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.35.102.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -52,7 +52,11 @@ export const sendChatMessage = async (text: string, sessionId: string | null) =>
       session_id: sessionId
     }, { headers });
     return response.data;
-  } catch (error) {
+  } catch (error: any) {
+    if (error.response?.status === 401) {
+      console.warn('Unauthorized: Failed to send message');
+      return { text: "Your session has expired. Please log out from the sidebar and log back in." };
+    }
     console.error('Failed to send message:', error);
     throw error;
   }
@@ -82,6 +86,10 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
       }
     );
     
+    if (uploadTask.status === 401) {
+      console.warn('Unauthorized: Failed to send audio');
+      return { text: "Your session has expired. Please log out from the sidebar and log back in." };
+    }
     if (uploadTask.status !== 200) {
       throw new Error(`HTTP error! status: ${uploadTask.status}`);
     }
@@ -117,6 +125,10 @@ export const uploadFile = async (fileUri: string, fileName: string, sessionId: s
       }
     );
     
+    if (uploadTask.status === 401) {
+      console.warn('Unauthorized: Failed to upload file');
+      return { error: "Your session has expired. Please log out and log back in." };
+    }
     if (uploadTask.status !== 200) {
       throw new Error(`HTTP error! status: ${uploadTask.status}`);
     }
@@ -132,7 +144,11 @@ export const generateImage = async (prompt: string) => {
   try {
     const response = await axios.post(`${API_URL}/api/generate_image`, { prompt });
     return response.data;
-  } catch (error) {
+  } catch (error: any) {
+    if (error.response?.status === 401) {
+      console.warn('Unauthorized: Failed to generate image');
+      return { error: "Your session has expired. Please log out and log back in." };
+    }
     console.error('Generate image error', error);
     throw error;
   }
