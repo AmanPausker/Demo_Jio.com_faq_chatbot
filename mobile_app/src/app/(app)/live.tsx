@@ -1,33 +1,13 @@
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
+import { Audio } from 'expo-av';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Feather } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
-import * as FileSystem from 'expo-file-system/legacy';
+import { RTCPeerConnection, RTCSessionDescription, mediaDevices } from 'react-native-webrtc';
 import { supabase } from '../../utils/supabaseClient';
 import { WaveAnimation, WaveType } from '../../components/WaveAnimation';
-
-// PCM encoding buffer
-const pcmEncode = (audioData: Float32Array): ArrayBuffer => {
-  const pcm = new Int16Array(audioData.length);
-  for (let i = 0; i < audioData.length; i++) {
-    pcm[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
-  }
-  return pcm.buffer;
-};
-
-const encodeBase64 = (buffer: ArrayBuffer): string => {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = Array.from(bytes.subarray(i, i + chunkSize));
-    binary += String.fromCharCode.apply(null, chunk);
-  }
-  return btoa(binary);
-};
 
 export default function LiveChatScreen() {
   const router = useRouter();
@@ -39,22 +19,18 @@ export default function LiveChatScreen() {
   const scrollViewRef = useRef<ScrollView>(null);
   
   const [messages, setMessages] = useState<any[]>([]);
-  const isRecordingRef = useRef(false);
   const activeSessionIdRef = useRef(Date.now().toString()); 
   
-  // TTS playback queue
-  const ttsQueueRef = useRef<string[]>([]);
-  const isPlayingRef = useRef(false);
-  const soundRef = useRef<Audio.Sound | null>(null);
-
   // Animation states
   const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const userSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Audio recording refs
-  const audioRecorderRef = useRef<any>(null);
-  const audioStreamRef = useRef<any>(null);
+  // WebRTC refs
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<any>(null);
+  const audioLevelIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isPlayingRef = useRef(false);
 
   // VAD logic
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -102,20 +78,24 @@ export default function LiveChatScreen() {
             } catch (e) {}
           }, 2000);
           
-          // Start streaming audio via PCM chunks through WebSocket
-          isRecordingRef.current = true;
-          startStreamingAudio(ws);
+          // Start streaming audio via WebRTC
+          startWebRTC(ws);
         };
 
         ws.onmessage = (event) => {
           const data = JSON.parse(event.data);
-          if (data.type === "assistant_response") {
+          if (data.type === "webrtc_answer") {
+            pcRef.current?.setRemoteDescription(new RTCSessionDescription(data.payload));
+          } else if (data.type === "assistant_response") {
             setMessages(prev => [...prev.slice(-2), { role: 'bot', text: data.payload }]);
+            setIsAssistantSpeaking(true);
+            setTimeout(() => setIsAssistantSpeaking(false), 3000); // Temporary fallback for TTS animation
           } else if (data.type === "transcript") {
             setMessages(prev => [...prev.slice(-2), { role: 'user', text: data.payload }]);
-          } else if (data.type === "tts_chunk") {
-            ttsQueueRef.current.push(data.payload);
-            playNextTTS();
+          } else if (data.type === "user_speaking_start") {
+            setUserSpeaking(true);
+          } else if (data.type === "user_speaking_end") {
+            setUserSpeaking(false);
           }
         };
       };
@@ -124,88 +104,69 @@ export default function LiveChatScreen() {
       
       return () => {
         mounted = false;
-        isRecordingRef.current = false;
         if (frameInterval) clearInterval(frameInterval);
-        if (wsRef.current) wsRef.current.close();
-        try {
-          if (soundRef.current) soundRef.current.unloadAsync();
-        } catch (e) {}
-        try {
-          if (audioRecorderRef.current) {
-            audioRecorderRef.current.stopAndUnloadAsync();
-          }
-        } catch (e) {}
+        stopWebRTC();
       };
     }, [])
   );
 
-  const playNextTTS = async () => {
-    if (isPlayingRef.current || ttsQueueRef.current.length === 0) return;
-    isPlayingRef.current = true;
-    setIsAssistantSpeaking(true);
-    const b64 = ttsQueueRef.current.shift();
-    
-    if (!b64) {
-        isPlayingRef.current = false;
-        setIsAssistantSpeaking(false);
-        playNextTTS();
-        return;
-    }
-    
+  const startWebRTC = async (ws: WebSocket) => {
     try {
-      const uri = `data:audio/wav;base64,${b64}`;
-      const { sound } = await Audio.Sound.createAsync({ uri });
-      soundRef.current = sound;
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      pcRef.current = pc;
       
-      sound.setOnPlaybackStatusUpdate((status: any) => {
-        if (status.didJustFinish) {
-          sound.unloadAsync();
-          isPlayingRef.current = false;
-          setIsAssistantSpeaking(false);
-          playNextTTS();
-        }
+      const stream = await mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+      localStreamRef.current = stream;
+      
+      stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
+      
+      const offer = await pc.createOffer({});
+      await pc.setLocalDescription(offer);
+      
+      await new Promise<void>((resolve) => {
+         if (pc.iceGatheringState === 'complete') {
+             resolve();
+         } else {
+             const timeout = setTimeout(() => resolve(), 2000);
+             pc.onicegatheringstatechange = () => {
+                 if (pc.iceGatheringState === 'complete') {
+                     clearTimeout(timeout);
+                     resolve();
+                 }
+             };
+         }
       });
-      await sound.playAsync();
-    } catch (e) {
-      console.error("Audio playback error:", e);
-      isPlayingRef.current = false;
-      setIsAssistantSpeaking(false);
-      playNextTTS();
+      
+      ws.send(JSON.stringify({ type: "webrtc_offer", payload: pc.localDescription }));
+
+    } catch (err) {
+      console.error('Failed to start WebRTC', err);
     }
   };
 
-  const startStreamingAudio = async (ws: WebSocket) => {
-    if (!isRecordingRef.current) return;
-    
-    try {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: false,
-      });
-      
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-        (status) => {
-          if (status.metering) {
-            handleMetering(status.metering, ws);
-          }
-        },
-        100
-      );
-      audioRecorderRef.current = recording;
-    } catch (err) {
-      console.error("Audio start error", err);
-      setTimeout(() => startStreamingAudio(ws), 1000);
+  const stopWebRTC = () => {
+    isSpeakingState.current = false;
+    if (audioLevelIntervalRef.current) clearInterval(audioLevelIntervalRef.current);
+    if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t: any) => t.stop());
+        localStreamRef.current = null;
     }
+    if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
+    }
+    if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+    }
+    isPlayingRef.current = false;
+    setIsAssistantSpeaking(false);
   };
 
   const handleMetering = (db: number, ws: WebSocket) => {
-    if (isPlayingRef.current) return;
+    const currentThreshold = isPlayingRef.current ? -15 : VOLUME_THRESHOLD;
 
-    if (db > VOLUME_THRESHOLD) {
+    if (db > currentThreshold) {
       setUserSpeaking(true);
       if (userSpeakingTimeoutRef.current) clearTimeout(userSpeakingTimeoutRef.current);
       userSpeakingTimeoutRef.current = setTimeout(() => setUserSpeaking(false), 1000);
@@ -216,39 +177,17 @@ export default function LiveChatScreen() {
       }
       if (!isSpeakingState.current) {
         isSpeakingState.current = true;
-        if (soundRef.current && isPlayingRef.current) {
-          soundRef.current.stopAsync().catch(() => {});
-          isPlayingRef.current = false;
-          setIsAssistantSpeaking(false);
-        }
         ws.send(JSON.stringify({ type: "interrupt" }));
       }
     } else {
       if (isSpeakingState.current && !silenceTimerRef.current) {
         silenceTimerRef.current = setTimeout(() => {
           isSpeakingState.current = false;
-          handleSpeechEnd(ws);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "speech_ended" }));
+          }
         }, SILENCE_MS_TO_STOP);
       }
-    }
-  };
-
-  const handleSpeechEnd = async (ws: WebSocket) => {
-    if (!audioRecorderRef.current || !isRecordingRef.current) return;
-    try {
-      await audioRecorderRef.current.stopAndUnloadAsync();
-      const uri = audioRecorderRef.current.getURI();
-      audioRecorderRef.current = null;
-      
-      if (uri && ws.readyState === WebSocket.OPEN) {
-        const base64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
-        ws.send(JSON.stringify({ type: "audio_file_full", payload: base64 }));
-      }
-      
-      startStreamingAudio(ws);
-    } catch (e) {
-      console.error('Stop recording error', e);
-      startStreamingAudio(ws);
     }
   };
 
