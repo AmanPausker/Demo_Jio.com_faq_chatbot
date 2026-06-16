@@ -9,13 +9,13 @@ LOKI_URL = os.getenv("LOKI_URL", "http://localhost:3100/loki/api/v1/push")
 APP_ENV  = os.getenv("APP_ENV", "development")
 
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.WARNING)
+console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(
     logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 )
 
 # Root logger config
-logging.basicConfig(level=logging.WARNING, handlers=[console_handler])
+logging.basicConfig(level=logging.DEBUG, handlers=[console_handler])
 
 # ── Main app logger (chat, audio, PDF, sessions) ──────────────────────────────
 loki_handler = logging_loki.LokiHandler(
