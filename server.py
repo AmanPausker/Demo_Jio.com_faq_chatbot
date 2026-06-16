@@ -373,7 +373,9 @@ class TTSAudioTrack(MediaStreamTrack):
     def __init__(self):
         super().__init__()
         self._queue = asyncio.Queue()
+        self._buffer = bytearray()
         self._pts = 0
+        self._time_base = fractions.Fraction(1, 16000)
 
     async def add_audio(self, wav_bytes: bytes):
         import io
@@ -383,16 +385,25 @@ class TTSAudioTrack(MediaStreamTrack):
             for frame in container.decode(audio=0):
                 resampled = resampler.resample(frame)
                 for r_frame in resampled:
-                    await self._queue.put(r_frame.planes[0].to_bytes())
+                    await self._queue.put(r_frame.to_ndarray().tobytes())
         except Exception as e:
-            logger.debug(f"Failed to decode TTS audio for WebRTC: {e}")
+            logger.error(f"Failed to decode TTS audio for WebRTC: {e}")
 
     async def recv(self):
-        try:
-            pcm_data = await asyncio.wait_for(self._queue.get(), timeout=0.02)
-        except asyncio.TimeoutError:
-            samples = 16000 * 20 // 1000
-            pcm_data = b'\x00' * (samples * 2)
+        chunk_size = 640  # 320 samples (20ms at 16000Hz)
+
+        while len(self._buffer) < chunk_size:
+            try:
+                chunk = await asyncio.wait_for(self._queue.get(), timeout=0.02)
+                self._buffer.extend(chunk)
+            except asyncio.TimeoutError:
+                break
+
+        if len(self._buffer) >= chunk_size:
+            pcm_data = bytes(self._buffer[:chunk_size])
+            del self._buffer[:chunk_size]
+        else:
+            pcm_data = b'\x00' * chunk_size
 
         samples = len(pcm_data) // 2
         frame = av.AudioFrame(format='s16', layout='mono', samples=samples)
@@ -400,8 +411,17 @@ class TTSAudioTrack(MediaStreamTrack):
         frame.planes[0].update(pcm_data)
         
         frame.pts = self._pts
-        frame.time_base = fractions.Fraction(1, 16000)
+        frame.time_base = self._time_base
         self._pts += samples
+
+        # Pace the stream
+        if not hasattr(self, "_start"):
+            self._start = time.time()
+
+        wait = self._start + (self._pts / 16000) - time.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+
         return frame
 
 
@@ -504,9 +524,9 @@ async def fetch_tts_sentence(text: str) -> str | None:
                     return data["audios"][0]
             else:
                 err_text = await resp.text()
-                logger.debug(f"TTS API error {resp.status} for: '{text[:40]}' - Reason: {err_text}")
+                logger.error(f"[TTS] API error {resp.status} for: '{text[:40]}' - Reason: {err_text}")
     except Exception as e:
-        logger.debug(f"TTS sentence error: {e}")
+        logger.error(f"[TTS] sentence error: {e}")
     return None
 
 
@@ -952,6 +972,15 @@ async def live_chat_websocket(websocket: WebSocket):
         live_logger.info(f"[LIVE WS] Authenticated: user={user_id} session={session_id}")
         session = manager.get_session(session_id, user_id)
 
+        # Clear any stale WebRTC connection from previous WebSocket sessions
+        if getattr(session, "pc", None) is not None:
+            try:
+                asyncio.create_task(session.pc.close())
+            except Exception:
+                pass
+            session.pc = None
+            session.tts_track = None
+
         try:
             while True:
                 data = await websocket.receive_json()
@@ -1029,6 +1058,13 @@ async def live_chat_websocket(websocket: WebSocket):
 
         except WebSocketDisconnect:
             live_logger.info(f"[LIVE WS] Disconnected: user={user_id} session={session_id}")
+            if getattr(session, "pc", None) is not None:
+                try:
+                    asyncio.create_task(session.pc.close())
+                except Exception:
+                    pass
+                session.pc = None
+                session.tts_track = None
     except Exception as e:
         live_logger.error(f"[LIVE WS] Error: {e}")
         try:
