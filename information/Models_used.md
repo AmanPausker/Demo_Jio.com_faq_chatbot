@@ -37,7 +37,6 @@ Both models are loaded at server startup and held in memory for the lifetime of 
 
 Silero VAD is loaded once (`load_silero_vad()`) and reused across all connections. A `VADIterator` instance is created per session.
 
----
 
 ## 2. System Design
 
@@ -250,7 +249,5 @@ Qdrant upsert (jio_documents collection)
 │ (until cleared)  │  │ at >5 messages   │  │ lost on restart  │
 └──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
-
----
 
 

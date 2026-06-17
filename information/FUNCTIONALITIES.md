@@ -7,14 +7,11 @@
 4. [Hybrid RAG Pipeline](#4-hybrid-rag-pipeline)
 5. [PDF Document Ingestion & Retrieval](#5-pdf-document-ingestion--retrieval)
 6. [Vision (Image Upload & Analysis)](#6-vision-image-upload--analysis)
-7. [Image Generation](#7-image-generation)
-8. [Long-Term Memory](#8-long-term-memory)
-9. [Short-Term Memory & Conversation History](#9-short-term-memory--conversation-history)
-10. [Session Management](#10-session-management)
-11. [Authentication](#11-authentication)
-12. [A2UI Rich Cards](#12-a2ui-rich-cards)
-13. [Observability / Logging](#13-observability--logging)
-14. [Gradio Dev UI](#14-gradio-dev-ui)
+7. [Long-Term Memory](#7-long-term-memory)
+8. [Short-Term Memory & Conversation History](#8-short-term-memory--conversation-history)
+9. [Session Management](#9-session-management)
+10. [Authentication](#10-authentication)
+11. [A2UI Rich Cards](#11-a2ui-rich-cards)
 
 ---
 
@@ -147,19 +144,7 @@ In live video mode, this same approach is used dynamically — the latest camera
 
 ---
 
-## 7. Image Generation
-
-**What it does:** Users can generate images from text prompts using the `/imagine` command or a dedicated image mode.
-
-**Endpoint:** `POST /api/generate_image`
-
-**How it's implemented:**
-
-The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest-labs/flux-1-schnell` model. The API returns a JPEG blob which is base64-encoded and returned to the frontend where it's rendered inline in the chat.
-
----
-
-## 8. Long-Term Memory
+## 7. Long-Term Memory
 
 **What it does:** The bot remembers personal facts about users across sessions (e.g., "User lives in Mumbai", "User prefers prepaid").
 
@@ -173,7 +158,7 @@ The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest
 
 ---
 
-## 9. Short-Term Memory & Conversation History
+## 8. Short-Term Memory & Conversation History
 
 **What it does:** The bot maintains conversation context within a session and prevents the context window from growing indefinitely.
 
@@ -185,7 +170,7 @@ The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest
 
 ---
 
-## 10. Session Management
+## 9. Session Management
 
 **What it does:** Each conversation is a named session that users can switch between, load, or delete.
 
@@ -199,7 +184,7 @@ The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest
 
 ---
 
-## 11. Authentication
+## 10. Authentication
 
 **What it does:** All API endpoints are protected. Each user sees only their own sessions and memories.
 
@@ -211,7 +196,7 @@ The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest
 
 ---
 
-## 12. A2UI Rich Cards
+## 11. A2UI Rich Cards
 
 **What it does:** The LLM can respond with structured UI components embedded in the chat (e.g., a WeatherCard with city, temperature, and condition).
 
@@ -222,29 +207,4 @@ The text prompt is sent to **Cloudflare Workers AI** using the `@cf/black-forest
 - The frontend uses `@a2ui/react` and `@a2ui/web_core` to render these messages as visual cards. The `A2UICatalog.tsx` file defines the component registry.
 - The spoken TTS text is cleaned to remove the JSON so the bot speaks naturally ("The weather in Mumbai is 32 degrees") while the card is displayed visually.
 
----
 
-## 13. Observability / Logging
-
-**What it does:** All key events (chat requests, audio processing, PDF uploads, memory decisions, latency metrics) are logged and visualized.
-
-**How it's implemented (`logger.py` + `docker-compose.yml`):**
-
-- Two Python loggers are configured: `jio_bot` (for general events) and `jio_bot.live` (for live video chat events).
-- Both send structured logs to **Grafana Loki** (`logging_loki` handler) using the `/loki/api/v1/push` endpoint, tagged with `app` and `env` labels.
-- **Grafana** (port 3000) is used to query and visualize the Loki streams with dashboards for latency, routing decisions, and error rates.
-- Both services run via `docker-compose.yml` with named volumes (`loki_data`, `grafana_data`) for persistence.
-
----
-
-## 14. Gradio Dev UI
-
-**What it does:** A standalone development interface without authentication, used for quickly testing the RAG pipeline.
-
-**How it's implemented (`app.py`):**
-
-- Built with Gradio `Blocks`. Exposes text input and a mic button.
-- Text mode calls the LangGraph workflow directly via `app.ainvoke()`.
-- Audio mode calls `listen_for_speech()` from `get_transcript.py` which opens a live microphone stream with Silero VAD on the server machine.
-- Responses are played back via `generate_speech()` (Sarvam TTS).
-- Launched on `0.0.0.0:7860` when running `python app.py`.
