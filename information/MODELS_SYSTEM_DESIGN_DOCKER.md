@@ -1,4 +1,4 @@
-# Models, System Design & Docker
+# Models & System Design
 
 ---
 
@@ -37,12 +37,6 @@ Both models are loaded at server startup and held in memory for the lifetime of 
 
 Silero VAD is loaded once (`load_silero_vad()`) and reused across all connections. A `VADIterator` instance is created per session.
 
-### Image Generation
-
-| Model | Provider | Used For |
-|---|---|---|
-| `@cf/black-forest-labs/flux-1-schnell` | Cloudflare Workers AI | Text-to-image generation from the `/imagine` command or image generation mode |
-
 ---
 
 ## 2. System Design
@@ -73,7 +67,6 @@ Silero VAD is loaded once (`load_silero_vad()`) and reused across all connection
 │  DELETE /api/sessions/{id}                                   │
 │  POST /api/upload        │                                   │
 │  POST /api/vision        │                                   │
-│  POST /api/generate_image│                                   │
 │  GET  /api/memory        │                                   │
 │                                                              │
 │  ┌─────────────────────────────────────────────────────┐     │
@@ -260,85 +253,4 @@ Qdrant upsert (jio_documents collection)
 
 ---
 
-## 3. Docker Usage
 
-### Why Docker Is Used
-
-Docker is used **exclusively for the observability stack** — specifically for running **Grafana Loki** (log aggregation) and **Grafana** (log visualization and dashboarding). These are infrastructure services, not application code, and running them in containers means:
-
-- **No installation friction** — Loki and Grafana have complex configs. Docker pulls the exact versioned images and runs them with a single command.
-- **Isolation** — The monitoring stack doesn't pollute the Python virtual environment or conflict with system packages.
-- **Persistent data** — Named Docker volumes (`loki_data`, `grafana_data`) survive container restarts, so logs and dashboards are never lost.
-- **Reproducibility** — The exact same versions (`grafana/loki:2.9.0`, `grafana/grafana:10.2.0`) run on every developer machine and in CI.
-
-The main **FastAPI backend**, **Neo4j**, **Qdrant**, and **frontend** are NOT Dockerized — they run directly on the host (or are cloud-hosted in the case of Supabase and Qdrant Cloud).
-
-### How Docker Is Used (`docker-compose.yml`)
-
-```yaml
-services:
-  loki:
-    image: grafana/loki:2.9.0      # Log aggregation engine
-    container_name: loki
-    ports:
-      - "3100:3100"                # The Python logger pushes to http://localhost:3100/loki/api/v1/push
-    command: -config.file=/etc/loki/local-config.yaml
-    volumes:
-      - loki_data:/loki            # Persisted log storage
-
-  grafana:
-    image: grafana/grafana:10.2.0  # Visualization dashboard
-    container_name: grafana
-    ports:
-      - "3000:3000"                # UI accessible at http://localhost:3000
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana_data:/var/lib/grafana   # Persisted dashboards and config
-    depends_on:
-      - loki                       # Grafana starts after Loki is up
-
-volumes:
-  loki_data:
-  grafana_data:
-```
-
-### How Logs Flow Into Docker
-
-The Python application (`logger.py`) configures two loggers:
-
-```
-Python Code (server.py, nodes.py)
-        │
-        │  logger.info("...") / live_logger.info("...")
-        ▼
-logging_loki.LokiHandler (in-process)
-        │
-        │  HTTP POST to http://localhost:3100/loki/api/v1/push
-        ▼
-Loki container (port 3100) → loki_data volume
-        │
-        │  LogQL queries
-        ▼
-Grafana container (port 3000) → dashboards
-```
-
-Two separate Loki log streams are created:
-- `app=jio_bot` — general app events (chat requests, RAG scores, PDF processing, memory decisions).
-- `app=jio_bot_live` — live video chat events (vision latency, STT results, primary LLM responses).
-
-### Starting the Observability Stack
-
-```bash
-# Start Loki + Grafana
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop
-docker-compose down
-```
-
-After starting, add Loki as a data source in Grafana at `http://localhost:3000` using URL `http://loki:3100`, then build dashboards with LogQL to filter by `app`, `env`, and log content.

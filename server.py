@@ -389,6 +389,14 @@ class TTSAudioTrack(MediaStreamTrack):
         except Exception as e:
             logger.error(f"Failed to decode TTS audio for WebRTC: {e}")
 
+    def clear_queue(self):
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._buffer.clear()
+
     async def recv(self):
         chunk_size = 640  # 320 samples (20ms at 16000Hz)
 
@@ -439,6 +447,7 @@ class Session:
         }
         self.last_region_hashes: tuple = (None, None, None)
         self.is_processing: bool = False
+        self.current_response_id: str | None = None
         self.last_activity_time: float = time.time()
 
         # Audio buffering
@@ -627,6 +636,9 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     - Producer/consumer queue delivers TTS chunks in order while LLM still streams
     """
     t_start = time.time()
+    import uuid
+    my_response_id = str(uuid.uuid4())
+    session.current_response_id = my_response_id
     session.is_processing = True
     session.conversation_history.append({"role": "user", "content": question})
 
@@ -720,7 +732,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             first_token = True
             try:
                 async for chunk in primary_llm.astream(messages):
-                    if not session.is_processing:
+                    if not session.is_processing or session.current_response_id != my_response_id:
                         logger.debug("[STREAM] LLM interrupted by barge-in.")
                         break
                     token = chunk.content
@@ -744,7 +756,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             except Exception as e:
                 logger.debug(f"[STREAM] LLM streaming error: {e}")
             finally:
-                if sentence_buffer.strip() and session.is_processing:
+                if sentence_buffer.strip() and session.is_processing and session.current_response_id == my_response_id:
                     task = asyncio.create_task(fetch_tts_sentence(sentence_buffer.strip()))
                     await tts_queue.put(task)
                 await tts_queue.put(None)  # Sentinel
@@ -757,7 +769,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                 task = await tts_queue.get()
                 if task is None:
                     break
-                if not session.is_processing:
+                if not session.is_processing or session.current_response_id != my_response_id:
                     task.cancel()
                     continue
                 try:
@@ -907,6 +919,8 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
             if "start" in result:
                 logger.info(f"[VAD] Speech started")
                 session.is_processing = False
+                if getattr(session, "tts_track", None):
+                    session.tts_track.clear_queue()
                 try:
                     await websocket.send_json({"type": "interrupt_ack"})
                     await websocket.send_json({"type": "user_speaking_start"})
@@ -1028,6 +1042,8 @@ async def live_chat_websocket(websocket: WebSocket):
 
                 elif event_type == "interrupt":
                     session.is_processing = False
+                    if getattr(session, "tts_track", None):
+                        session.tts_track.clear_queue()
                     await websocket.send_json({"type": "interrupt_ack"})
 
                 elif event_type == "speech_ended":

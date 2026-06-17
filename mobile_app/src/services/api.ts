@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.35.102.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.70.243.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
