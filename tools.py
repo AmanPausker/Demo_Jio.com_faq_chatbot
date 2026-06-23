@@ -23,11 +23,15 @@ def get_weather(city:str)->str:
 
     if response.status_code != 200:
         return f"Error: {data}"
-    return (
-        f"Weather in {data['name']}: "
-        f"{data['weather'][0]['description']}, "
-        f"Temperature: {data['main']['temp']}°C"
-    )
+    import json
+    return json.dumps({
+        "type": "WeatherCard",
+        "props": {
+            "city": data['name'],
+            "temperature": data['main']['temp'],
+            "condition": data['weather'][0]['description']
+        }
+    })
 
 @tool
 def get_current_location()->str:

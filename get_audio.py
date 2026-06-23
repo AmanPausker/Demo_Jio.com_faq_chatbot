@@ -49,8 +49,13 @@ async def generate_speech(input_text: str, **kwargs):
             chunks = [input_text]
             
         async def get_chunk(c, index):
+            import re
+            clean_text = re.sub(r'[^\w\s.,!?\'"-]', '', c).strip()
+            if not re.search(r'[a-zA-Z\u0900-\u097F]', clean_text):
+                return index, b''
+                
             res = await client.text_to_speech.convert(
-                text=c,
+                text=clean_text,
                 target_language_code="hi-IN",
                 speaker="shubh",
                 model="bulbul:v3"
@@ -129,8 +134,13 @@ async def generate_speech_stream(text: str):
     headers = {"api-subscription-key": api_key}
 
     async def fetch_chunk(chunk_text):
+        import re
+        clean_text = re.sub(r'[^\w\s.,!?\'"-]', '', chunk_text).strip()
+        if not re.search(r'[a-zA-Z\u0900-\u097F]', clean_text):
+            return None
+            
         payload = {
-            "inputs": [chunk_text],
+            "inputs": [clean_text],
             "target_language_code": "hi-IN",
             "speaker": "shubh",
             "pitch": 0,

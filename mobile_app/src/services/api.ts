@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.70.243.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.137.66.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -44,22 +44,62 @@ export const loadSessionHistory = async (sessionId: string) => {
   }
 };
 
-export const sendChatMessage = async (text: string, sessionId: string | null) => {
-  try {
-    const headers = await getHeaders();
-    const response = await axios.post(`${API_URL}/api/chat`, {
-      message: text,
-      session_id: sessionId
-    }, { headers });
-    return response.data;
-  } catch (error: any) {
-    if (error.response?.status === 401) {
-      console.warn('Unauthorized: Failed to send message');
-      return { text: "Your session has expired. Please log out from the sidebar and log back in." };
+import EventSource from 'react-native-sse';
+
+export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void) => {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const headers = await getHeaders();
+      
+      const es = new EventSource(`${API_URL}/api/chat`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: text,
+          session_id: sessionId
+        }),
+      });
+
+      es.addEventListener('message', (event) => {
+        if (event.data) {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'token') {
+              if (onChunk) onChunk(data.payload);
+            } else if (data.type === 'final') {
+              es.close();
+              resolve(data);
+            }
+          } catch (e) {
+            console.error('SSE JSON parse error', e);
+          }
+        }
+      });
+
+      es.addEventListener('error', (event) => {
+        if (event.type === 'error') {
+          console.error('SSE error:', event.message);
+          es.close();
+          if ((event as any).message?.includes('401')) {
+            resolve({ text: "Your session has expired. Please log out from the sidebar and log back in." });
+          } else {
+            reject(new Error(event.message || 'SSE Error'));
+          }
+        }
+      });
+    } catch (error: any) {
+      if (error.response?.status === 401) {
+        console.warn('Unauthorized: Failed to send message');
+        resolve({ text: "Your session has expired. Please log out from the sidebar and log back in." });
+      } else {
+        console.error('Failed to send message:', error);
+        reject(error);
+      }
     }
-    console.error('Failed to send message:', error);
-    throw error;
-  }
+  });
 };
 
 export const sendAudioMessage = async (audioUri: string, sessionId: string | null) => {
