@@ -100,35 +100,6 @@ function CustomDrawerContent(props: any) {
         )}
       />
 
-      <TouchableOpacity style={styles.settingsBtn} onPress={handleOpenSettings}>
-        <Feather name="settings" size={20} color="#a1a1aa" />
-        <Text style={styles.settingsText}>Settings</Text>
-      </TouchableOpacity>
-
-      <Modal
-        visible={settingsVisible}
-        animationType="slide"
-        transparent={true}
-        onRequestClose={() => setSettingsVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Settings</Text>
-              <TouchableOpacity onPress={() => setSettingsVisible(false)}>
-                <Feather name="x" size={24} color="#a1a1aa" />
-              </TouchableOpacity>
-            </View>
-            
-            <Text style={styles.modalLabel}>User Email</Text>
-            <View style={styles.modalBox}>
-              <Text style={styles.modalText}>{userId || 'Loading...'}</Text>
-            </View>
-
-
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }

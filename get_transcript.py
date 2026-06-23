@@ -199,7 +199,7 @@ async def listen_for_speech(silence_timeout: float = 0.5) -> str: # returns fina
         # This continously tracks - speech start, speech end
         vad_iterator = VADIterator(
             _vad_model,
-            threshold=0.5,
+            threshold=0.8,
             sampling_rate=SAMPLE_RATE,
             min_silence_duration_ms=int(silence_timeout * 1000),
         )

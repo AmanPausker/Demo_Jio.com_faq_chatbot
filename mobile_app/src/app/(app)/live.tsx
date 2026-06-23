@@ -13,16 +13,18 @@ export default function LiveChatScreen() {
   const router = useRouter();
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [audioPermissionResponse, requestAudioPermission] = Audio.usePermissions();
-  
+
   const cameraRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
-  
+
   const [messages, setMessages] = useState<any[]>([]);
-  const activeSessionIdRef = useRef(Date.now().toString()); 
-  
+  const activeSessionIdRef = useRef(Date.now().toString());
+
   // Animation states
+  const [fillerText, setFillerText] = useState("");
   const [isAssistantSpeaking, setIsAssistantSpeaking] = useState(false);
+  const assistantSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const userSpeakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -52,21 +54,21 @@ export default function LiveChatScreen() {
 
       let mounted = true;
       let frameInterval: ReturnType<typeof setInterval>;
-      
+
       const connectWs = async () => {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) return;
-        
+
         const wsUrl = process.env.EXPO_PUBLIC_API_URL?.replace('http', 'ws') + '/api/live/ws';
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
-        
+
         ws.onopen = async () => {
           ws.send(JSON.stringify({
             type: "auth",
             payload: { token: session.access_token, session_id: activeSessionIdRef.current }
           }));
-          
+
           // Start Video Loop (0.5 FPS)
           frameInterval = setInterval(async () => {
             if (!mounted || !cameraRef.current) return;
@@ -75,36 +77,43 @@ export default function LiveChatScreen() {
               if (photo && photo.base64 && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: "video_frame", payload: photo.base64 }));
               }
-            } catch (e) {}
+            } catch (e) { }
           }, 2000);
-          
+
           // Start streaming audio via WebRTC
           startWebRTC(ws);
         };
 
         ws.onmessage = (event) => {
           const data = JSON.parse(event.data);
-          if (data.type === "webrtc_answer") {
+          if (data.type === "filler_word") {
+            setFillerText(data.payload);
+          } else if (data.type === "webrtc_answer") {
             pcRef.current?.setRemoteDescription(new RTCSessionDescription(data.payload));
           } else if (data.type === "assistant_response") {
+            setFillerText(""); // Clear filler text
             setMessages(prev => [...prev.slice(-2), { role: 'bot', text: data.payload }]);
             setIsAssistantSpeaking(true);
-            setTimeout(() => setIsAssistantSpeaking(false), 3000); // Temporary fallback for TTS animation
+            if (assistantSpeakingTimeoutRef.current) clearTimeout(assistantSpeakingTimeoutRef.current);
+            assistantSpeakingTimeoutRef.current = setTimeout(() => setIsAssistantSpeaking(false), 3000);
           } else if (data.type === "transcript") {
             setMessages(prev => [...prev.slice(-2), { role: 'user', text: data.payload }]);
           } else if (data.type === "user_speaking_start") {
+            setFillerText(""); // Clear filler text on user barge-in
             setUserSpeaking(true);
           } else if (data.type === "user_speaking_end") {
             setUserSpeaking(false);
           }
         };
       };
-      
+
       connectWs();
-      
+
       return () => {
         mounted = false;
         if (frameInterval) clearInterval(frameInterval);
+        if (assistantSpeakingTimeoutRef.current) clearTimeout(assistantSpeakingTimeoutRef.current);
+        if (userSpeakingTimeoutRef.current) clearTimeout(userSpeakingTimeoutRef.current);
         stopWebRTC();
       };
     }, [])
@@ -114,29 +123,29 @@ export default function LiveChatScreen() {
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       pcRef.current = pc;
-      
+
       const stream = await mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
       localStreamRef.current = stream;
-      
+
       stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
-      
+
       const offer = await pc.createOffer({});
       await pc.setLocalDescription(offer);
-      
+
       await new Promise<void>((resolve) => {
-         if (pc.iceGatheringState === 'complete') {
-             resolve();
-         } else {
-             const timeout = setTimeout(() => resolve(), 2000);
-             pc.onicegatheringstatechange = () => {
-                 if (pc.iceGatheringState === 'complete') {
-                     clearTimeout(timeout);
-                     resolve();
-                 }
-             };
-         }
+        if (pc.iceGatheringState === 'complete') {
+          resolve();
+        } else {
+          const timeout = setTimeout(() => resolve(), 2000);
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') {
+              clearTimeout(timeout);
+              resolve();
+            }
+          };
+        }
       });
-      
+
       ws.send(JSON.stringify({ type: "webrtc_offer", payload: pc.localDescription }));
 
     } catch (err) {
@@ -148,16 +157,16 @@ export default function LiveChatScreen() {
     isSpeakingState.current = false;
     if (audioLevelIntervalRef.current) clearInterval(audioLevelIntervalRef.current);
     if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t: any) => t.stop());
-        localStreamRef.current = null;
+      localStreamRef.current.getTracks().forEach((t: any) => t.stop());
+      localStreamRef.current = null;
     }
     if (pcRef.current) {
-        pcRef.current.close();
-        pcRef.current = null;
+      pcRef.current.close();
+      pcRef.current = null;
     }
     if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+      wsRef.current.close();
+      wsRef.current = null;
     }
     isPlayingRef.current = false;
     setIsAssistantSpeaking(false);
@@ -195,9 +204,9 @@ export default function LiveChatScreen() {
     return (
       <View style={styles.container}>
         <View style={styles.header}>
-            <TouchableOpacity onPress={() => router.replace('/chat')} style={styles.backBtn}>
-              <Feather name="arrow-left" size={24} color="#fff" />
-            </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.replace('/chat')} style={styles.backBtn}>
+            <Feather name="arrow-left" size={24} color="#fff" />
+          </TouchableOpacity>
         </View>
         <Text style={styles.text}>Requesting permissions...</Text>
       </View>
@@ -217,11 +226,11 @@ export default function LiveChatScreen() {
           <Text style={styles.title}>Live Camera</Text>
           <View style={styles.recordingDot} />
         </View>
-        
+
         <WaveAnimation type={waveType} />
 
-        <ScrollView 
-          style={styles.messagesScrollView} 
+        <ScrollView
+          style={styles.messagesScrollView}
           contentContainerStyle={styles.messagesContent}
           ref={scrollViewRef}
           onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
@@ -232,6 +241,12 @@ export default function LiveChatScreen() {
               <Text style={styles.messageText}>{m.text}</Text>
             </View>
           ))}
+          {fillerText ? (
+            <View style={styles.messageBox}>
+              <Text style={styles.messageLabel}>AI</Text>
+              <Text style={[styles.messageText, { fontStyle: 'italic', opacity: 0.7 }]}>{fillerText}</Text>
+            </View>
+          ) : null}
         </ScrollView>
       </View>
     </View>

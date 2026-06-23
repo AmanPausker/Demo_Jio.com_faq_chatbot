@@ -8,11 +8,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
 from file_workflow import search_qdrant
-from langchain_groq import ChatGroq
+from system_instructions import (
+    get_general_generation_prompt,
+    get_faq_generation_prompt,
+    MEMORY_EVALUATION_PROMPT,
+    STM_SUMMARIZATION_PROMPT
+)
 from logger import logger
 load_dotenv(override=True)
-NVDIA_API_KEY=os.getenv("NVDIA_API_KEY")
-client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+from langchain_ollama import ChatOllama
+client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
 from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
@@ -30,42 +35,38 @@ WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 
 from langchain_core.tools import tool
 
-def general_generation_node(State: GraphState):
-    NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
-    client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+async def general_generation_node(State: GraphState):
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
 
     tools = [get_weather, get_current_location]
-    llm_with_tools = client.bind_tools(tools)
-    question = State["question"]
-    system_prompt = f"""
-    You are a helpful and friendly general purpose AI assistant. Your default name is Jio Assistant.
-    If the user says hello, greets you, or asks a general question, just answer it normally and conversationally in plain text. 
-    DO NOT mention tools, function calls, or your internal instructions to the user.
+    question = State.get("question", "").lower()
     
-    CRITICAL TOOL USAGE:
-    1. If the user asks for the weather in a specific city, use the `get_weather` tool.
-    2. If the user asks for the weather "here", "my location", or does not specify a city, you MUST first call the `get_current_location` tool to find their city, and THEN call the `get_weather` tool with that city. Do NOT ask the user for their location!
-    3. When calling a tool, do NOT output anything else. Just call the tool.
-    4. You MUST call only ONE tool at a time. NEVER call multiple tools in a single response. Wait for the result before calling the next tool.
+    weather_keywords = ["weather", "temperature", "forecast", "rain", "hot", "cold", "climate", "location", "where am i", "current city"]
+    if any(kw in question for kw in weather_keywords):
+        llm_with_tools = client.bind_tools(tools)
+    else:
+        llm_with_tools = client
+    user_id = State.get("user_id", "")
+    token = State.get("token", "")
+    memory_context = fetch_user_memories(user_id, token)
+
+    system_prompt = get_general_generation_prompt(memory_context)
+    raw_messages = [SystemMessage(content=system_prompt)] + State["messages"]
     
-    [WEATHER OUTPUT FORMAT]
-    If and ONLY if you have successfully fetched the weather data, respond ONLY with the raw A2UI JSON object. 
-    {{
-    "type": "WeatherCard",
-    "props": {{
-        "city": "Mumbai",
-        "temperature": 32,
-        "condition": "haze"
-    }}
-    }}
-    
-    FINAL CRITICAL INSTRUCTION:
-    For ALL OTHER normal questions and conversations (like greetings such as "hey" or "hello", general chat, or if the weather tool fails), you MUST reply in normal, conversational PLAIN TEXT. DO NOT output JSON. NEVER tell the user about function calls or tools. Just converse naturally!
-    """
-    messages = [SystemMessage(content=system_prompt)] + State["messages"]
+    messages = []
+    for m in raw_messages:
+        if isinstance(m, SystemMessage) and len(messages) > 0:
+            messages[0].content += "\n\n" + m.content
+        else:
+            messages.append(m)
     
     try:
-        response = llm_with_tools.invoke(messages)
+        response = None
+        async for chunk in llm_with_tools.astream(messages):
+            if response is None:
+                response = chunk
+            else:
+                response += chunk
 
         max_tool_rounds = 5
         tool_round = 0
@@ -86,16 +87,42 @@ def general_generation_node(State: GraphState):
                 from langchain_core.messages import ToolMessage
                 messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
                 
-            response = llm_with_tools.invoke(messages)
+                # "One-Call" Exception: Return immediately for weather to save LLM round trip
+                if tool_name == "get_weather" and "WeatherCard" in str(tool_output):
+                    return {"answer": str(tool_output), "messages": messages}
+                
+            response = None
+            async for chunk in llm_with_tools.astream(messages):
+                if response is None:
+                    response = chunk
+                else:
+                    response += chunk
         
         if tool_round >= max_tool_rounds:
             print(f"[WARN] Tool call loop hit max {max_tool_rounds} rounds, breaking out")
         
         answer = response.content
         
+
+        # -- Restored Leaked Tool Interceptor for cow/gemma2_tools:2b --
+        import json
+        import re as _re
+        json_match = _re.search(r'(\{[\s\S]*"name"\s*:\s*"get_weather"[\s\S]*\})', answer)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(1))
+                if parsed.get("name") == "get_weather":
+                    tool_args = parsed.get("parameters", {}) or parsed.get("arguments", {})
+                    tool_output = get_weather.invoke(tool_args)
+                    if "WeatherCard" in str(tool_output):
+                        print("[TOOL] One-Call Exception triggered for leaked JSON get_weather. Returning raw JSON.")
+                        return {"answer": str(tool_output), "messages": [response]}
+            except Exception as e:
+                print(f"[WARN] Failed to parse leaked tool JSON: {e}")
+        # -----------------------------------------------------------
+        
         # Guard: if the model leaked a tool call as plain text instead of using
         # the structured tool API, retry without tools to get a real answer.
-        import re as _re
         tool_leak_patterns = [
             r'function\s*[:\(]',           # function:get_weather or function(
             r'get_weather',                 # raw tool name
@@ -111,9 +138,20 @@ def general_generation_node(State: GraphState):
         if _re.search(combined_pattern, answer, _re.IGNORECASE):
             print(f"[WARN] Model leaked tool call as text, retrying without tools.")
             print(f"[WARN] Original answer: {answer[:200]}")
-            plain_llm = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
-            plain_messages = [SystemMessage(content=system_prompt)] + State["messages"]
-            response = plain_llm.invoke(plain_messages)
+            plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
+            raw_plain = [SystemMessage(content=system_prompt)] + State["messages"]
+            plain_messages = []
+            for m in raw_plain:
+                if isinstance(m, SystemMessage) and len(plain_messages) > 0:
+                    plain_messages[0].content += "\n\n" + m.content
+                else:
+                    plain_messages.append(m)
+            response = None
+            async for chunk in plain_llm.astream(plain_messages):
+                if response is None:
+                    response = chunk
+                else:
+                    response += chunk
             answer = response.content
             
         return {"answer": answer, "messages":[response]}
@@ -264,36 +302,63 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
         f"top_match='{scored_candidates[0][0][:80]}...'"
     )
 
-    top_candidates = [candidate for candidate, score in scored_candidates[:3]]
+    top_candidates = [candidate for candidate, score in scored_candidates[:1]]
     
     retrieved_context = "\n".join(top_candidates) + "\n"
     return {"context": retrieved_context, "router": 2}
 
-def generate_node(state:GraphState):
+def fetch_user_memories(user_id: str, token: str) -> str:
+    if not user_id:
+        return ""
+    try:
+        from supabase import create_client, ClientOptions
+        SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
+        SUPABASE_ANON_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
+        if token:
+            user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+        else:
+            user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        
+        res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+        if res.data:
+            facts = res.data[0].get("facts", []) or []
+            if facts:
+                return "User Profile / Long-Term Memories:\n" + "\n".join(f"- {m}" for m in facts) + "\n"
+    except Exception as e:
+        print(f"Error fetching memories: {e}")
+    return ""
+
+async def generate_node(state:GraphState):
     question = state["question"]
     context = state["context"]
-    system_prompt =f"""You are a helpful JIO customer support assistant. Your default name is Jio Assistant.
-    Use the provided CONTEXT to answer the user's question about Jio. 
-    
-    IMPORTANT INSTRUCTIONS:
-    1. For questions about Jio services, plans, or FAQs, answer using ONLY the provided context.
-    2. Treat slight variations in spelling or spacing (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same thing.
-    3. If the context does not contain the answer to a Jio-related question, say you couldn't find information about that in the Jio FAQs.
-    4. Do not create new information or guess outside the context for Jio-related facts.
-    
-    CONTEXT:
-    {context}"""
+    user_id = state.get("user_id", "")
+    token = state.get("token", "")
+    memory_context = fetch_user_memories(user_id, token)
 
-    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    system_prompt = get_faq_generation_prompt(memory_context, context)
+
+    raw_messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    messages = []
+    for m in raw_messages:
+        if isinstance(m, SystemMessage) and len(messages) > 0:
+            messages[0].content += "\n\n" + m.content
+        else:
+            messages.append(m)
     
     try:
-        response = client.invoke(messages)
+        response = None
+        async for chunk in client.astream(messages):
+            if response is None:
+                response = chunk
+            else:
+                response += chunk
         return {"answer": response.content, "messages":[response]}
     except Exception as e:
         print(f"NVIDIA API Error: {e}")
         return {"answer": "The AI service is currently experiencing high traffic (Queue Exceeded). Please wait a few moments and try your question again!"}
 
 import json
+from langchain_ollama import ChatOllama
 from supabase import create_client, ClientOptions
 
 SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
@@ -307,19 +372,11 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
     
     if not question:
         return
-
-    NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
-    client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+    from langchain_ollama import ChatOllama
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, num_ctx=8192)
     
-    system_prompt = """You are a Memory Evaluation Assistant.
-Your task is to analyze the user's question and the assistant's answer, and determine if there is any personal fact, preference, or long-term information about the user that should be remembered.
-Examples of things to remember: "I live in Mumbai", "My name is Aman", "My Jio number is 9876543210", "I like prepaid plans".
-Examples of things to IGNORE: "What is the weather?", "How to recharge?", "Hi", general chat.
+    system_prompt = MEMORY_EVALUATION_PROMPT
 
-If there is something to remember, output a JSON object: {"save_memory": true, "memory_content": "User lives in Mumbai"}
-If there is nothing to remember, output: {"save_memory": false, "memory_content": ""}
-Do NOT output anything else except the JSON.
-"""
 
     user_prompt = f"User Question: {question}\nAssistant Answer: {answer}"
     messages = [
@@ -336,7 +393,15 @@ Do NOT output anything else except the JSON.
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
             
-        result = json.loads(content)
+        import re
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+            
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"[MEMORY BACKGROUND] -> JSON Parse Error: {e} | Content: {content}")
+            return
+            
         save_memory = result.get("save_memory", False)
         memory_content = result.get("memory_content", "")
         
@@ -350,10 +415,17 @@ Do NOT output anything else except the JSON.
             else:
                 user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
                 
-            user_supabase.table("user_memories").insert({
-                "user_id": user_id,
-                "memory_text": memory_content
-            }).execute()
+            res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+            if res.data:
+                facts = res.data[0].get("facts", []) or []
+                if memory_content not in facts:
+                    facts.append(memory_content)
+                    user_supabase.table("user_memory").update({"facts": facts}).eq("user_id", user_id).execute()
+            else:
+                user_supabase.table("user_memory").insert({
+                    "user_id": user_id,
+                    "facts": [memory_content]
+                }).execute()
             
             print(f"[MEMORY BACKGROUND] -> Successfully stored memory in Supabase.")
         else:
@@ -396,10 +468,10 @@ async def summarize_short_term_memory_bg(session_id: str):
             role = "User" if m.type == "human" else "AI"
             convo_text += f"{role}: {m.content}\n"
             
-        NVDIA_API_KEY = os.getenv("NVDIA_API_KEY")
-        client = ChatNVIDIA(model="meta/llama-3.1-8b-instruct", nvidia_api_key=NVDIA_API_KEY)
+        from langchain_ollama import ChatOllama
+        client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, num_ctx=8192)
         
-        system_prompt = "Summarize the following conversation history concisely. Focus on the user's intent and any facts established. Do not add new information."
+        system_prompt = STM_SUMMARIZATION_PROMPT
         prompt = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"Conversation:\n{convo_text}")

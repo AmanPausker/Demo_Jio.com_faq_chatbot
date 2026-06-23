@@ -1,0 +1,23 @@
+FROM ./qwen3.5-2b-Q4_K_M.gguf
+ADAPTER ./mmproj-qwen3.5-2b-f16.gguf
+TEMPLATE """{{ if .Messages }}
+{{- range .Messages }}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{- else if eq .Role "assistant" }}<|im_start|>assistant
+{{ .Content }}<|im_end|>
+{{- else if eq .Role "system" }}<|im_start|>system
+{{ .Content }}<|im_end|>
+{{- end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{- end }}
+{{- if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{- end }}
+{{- end }}
+<|im_start|>assistant
+"""
+SYSTEM You are a helpful assistant. Please answer directly.
