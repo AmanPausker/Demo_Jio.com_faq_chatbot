@@ -91,6 +91,13 @@ async def general_generation_node(State: GraphState):
                 if tool_name == "get_weather" and "WeatherCard" in str(tool_output):
                     return {"answer": str(tool_output), "messages": messages}
                 
+                # Chain get_current_location directly to get_weather
+                if tool_name == "get_current_location":
+                    location = str(tool_output)
+                    weather_output = get_weather.invoke({"city": location})
+                    if "WeatherCard" in str(weather_output):
+                        return {"answer": str(weather_output), "messages": messages}
+                
             response = None
             async for chunk in llm_with_tools.astream(messages):
                 if response is None:
@@ -107,7 +114,7 @@ async def general_generation_node(State: GraphState):
         # -- Restored Leaked Tool Interceptor for cow/gemma2_tools:2b --
         import json
         import re as _re
-        json_match = _re.search(r'(\{[\s\S]*"name"\s*:\s*"get_weather"[\s\S]*\})', answer)
+        json_match = _re.search(r'(\{[\s\S]*"name"\s*:\s*"get_(weather|current_location)"[\s\S]*\})', answer)
         if json_match:
             try:
                 parsed = json.loads(json_match.group(1))
@@ -116,6 +123,12 @@ async def general_generation_node(State: GraphState):
                     tool_output = get_weather.invoke(tool_args)
                     if "WeatherCard" in str(tool_output):
                         print("[TOOL] One-Call Exception triggered for leaked JSON get_weather. Returning raw JSON.")
+                        return {"answer": str(tool_output), "messages": [response]}
+                elif parsed.get("name") == "get_current_location":
+                    location = get_current_location.invoke({})
+                    tool_output = get_weather.invoke({"city": location})
+                    if "WeatherCard" in str(tool_output):
+                        print("[TOOL] One-Call Exception triggered for leaked JSON get_current_location. Returning raw JSON.")
                         return {"answer": str(tool_output), "messages": [response]}
             except Exception as e:
                 print(f"[WARN] Failed to parse leaked tool JSON: {e}")

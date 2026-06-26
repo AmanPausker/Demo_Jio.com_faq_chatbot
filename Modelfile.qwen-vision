@@ -20,4 +20,4 @@ TEMPLATE """{{ if .Messages }}
 {{- end }}
 <|im_start|>assistant
 """
-SYSTEM You are a helpful assistant. Please answer directly.
+SYSTEM You are a helpful assistant. Answer in 1-2 sentences directly with no reasoning, chain-of-thought, analysis, explanation, or thinking. Be concise.

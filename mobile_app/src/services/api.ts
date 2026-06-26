@@ -2,7 +2,7 @@ import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.137.66.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.169.209.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -46,7 +46,7 @@ export const loadSessionHistory = async (sessionId: string) => {
 
 import EventSource from 'react-native-sse';
 
-export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void) => {
+export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void, imageBase64?: string) => {
   return new Promise(async (resolve, reject) => {
     try {
       const headers = await getHeaders();
@@ -59,7 +59,8 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
         },
         body: JSON.stringify({
           message: text,
-          session_id: sessionId
+          session_id: sessionId,
+          image_base64: imageBase64
         }),
       });
 

@@ -216,7 +216,7 @@ function App() {
       setCameraStream(stream);
       if (videoRef.current) videoRef.current.srcObject = stream;
 
-      const socket = new WebSocket('ws://10.137.66.237:8000/api/live/ws');
+      const socket = new WebSocket('ws://10.169.209.237:8000/api/live/ws');
       socket.onopen = () => {
         socket.send(JSON.stringify({
           type: "auth",
@@ -457,7 +457,7 @@ function App() {
       audioStreamWsRef.current.close();
       audioStreamWsRef.current = null;
     }
-    const socket = new WebSocket('ws://10.137.66.237:8000/api/audio_stream/ws');
+    const socket = new WebSocket('ws://10.169.209.237:8000/api/audio_stream/ws');
     socket.onopen = () => {
       socket.send(JSON.stringify({ type: 'auth', payload: { token, session_id: sid } }));
       console.log('[AUDIO WS] Connected');
@@ -551,7 +551,7 @@ function App() {
   const fetchSessions = async () => {
     if (!session?.access_token) return;
     try {
-      const res = await fetch('http://10.137.66.237:8000/api/sessions', {
+      const res = await fetch('http://10.169.209.237:8000/api/sessions', {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -582,7 +582,7 @@ function App() {
     e.stopPropagation();
     if (!session?.access_token) return;
     try {
-      await fetch(`http://10.137.66.237:8000/api/sessions/${sessionId}`, {
+      await fetch(`http://10.169.209.237:8000/api/sessions/${sessionId}`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
@@ -602,7 +602,7 @@ function App() {
     setMessages([{ id: crypto.randomUUID(), role: 'bot', text: 'Loading history...' }]);
     if (!session?.access_token) return;
     try {
-      const res = await fetch(`http://10.137.66.237:8000/api/sessions/${sessionId}/history`, {
+      const res = await fetch(`http://10.169.209.237:8000/api/sessions/${sessionId}/history`, {
         headers: { 'Authorization': `Bearer ${session.access_token}` }
       });
       const data = await res.json();
@@ -658,7 +658,7 @@ function App() {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const response = await fetch('http://10.137.66.237:8000/api/upload', {
+      const response = await fetch('http://10.169.209.237:8000/api/upload', {
         method: 'POST',
         body: formData,
       });
@@ -700,7 +700,7 @@ function App() {
     const formData = new FormData();
     formData.append("image", file);
     try {
-      const response = await fetch('http://10.137.66.237:8000/api/vision', {
+      const response = await fetch('http://10.169.209.237:8000/api/vision', {
         method: 'POST',
         body: formData
       });
@@ -771,7 +771,7 @@ function App() {
     setGeneratedImage(null);
     setMessages(prev => [...prev, { id: crypto.randomUUID(), role: 'user', text: `\uD83C\uDFA8 Create image: ${prompt}` }]);
     try {
-      const response = await fetch('http://10.137.66.237:8000/api/generate_image', {
+      const response = await fetch('http://10.169.209.237:8000/api/generate_image', {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
@@ -806,7 +806,7 @@ function App() {
     if (userMsg.text.startsWith('/imagine ')) {
       const prompt = userMsg.text.replace('/imagine ', '');
       try {
-        const response = await fetch('http://10.137.66.237:8000/api/generate_image', {
+        const response = await fetch('http://10.169.209.237:8000/api/generate_image', {
           method: "POST",
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt })
@@ -830,7 +830,7 @@ function App() {
       return;
     }
     try {
-      const response = await fetch('http://10.137.66.237:8000/api/chat', {
+      const response = await fetch('http://10.169.209.237:8000/api/chat', {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json',
@@ -884,7 +884,7 @@ function App() {
     formData.append('audio', audioBlob, 'recording.wav');
     if (activeSessionId) formData.append('session_id', activeSessionId);
     try {
-      const response = await fetch('http://10.137.66.237:8000/api/chat/audio', {
+      const response = await fetch('http://10.169.209.237:8000/api/chat/audio', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${session?.access_token}` },
         body: formData

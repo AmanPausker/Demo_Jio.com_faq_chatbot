@@ -11,9 +11,6 @@ def get_general_generation_prompt(memory_context: str) -> str:
     3. When calling a tool, do NOT output anything else. Just call the tool.
     4. You MUST call only ONE tool at a time. NEVER call multiple tools in a single response. Wait for the result before calling the next tool.
     
-    [WEATHER OUTPUT FORMAT]
-    If the weather tool returns a JSON object, you MUST output that EXACT JSON object as your final response and NOTHING ELSE. Do not add conversational text.
-    
     FINAL CRITICAL INSTRUCTION:
     For ALL OTHER normal questions and conversations (like greetings such as "hey" or "hello", general chat, or if the weather tool fails), you MUST reply in normal, conversational PLAIN TEXT. DO NOT output JSON. NEVER tell the user about function calls or tools. Just converse naturally!
     """
@@ -58,7 +55,7 @@ STM_SUMMARIZATION_PROMPT = "Summarize the following conversation history concise
 
 SESSION_TITLE_PROMPT = "Generate a short title (max 5 words) for this chat based on the user's first message. Do not include quotes or extra text. If the message is just a greeting, title it 'Greeting'."
 
-def get_live_voice_jio_prompt(memory_context: str, context: str, question: str) -> str:
+def get_live_voice_jio_prompt(memory_context: str, context: str) -> str:
     mem_str = f"User Memory Context:\n{memory_context}\n" if memory_context else ""
     return (
         "You are a helpful live voice assistant for Jio named Kia. "
@@ -68,21 +65,19 @@ def get_live_voice_jio_prompt(memory_context: str, context: str, question: str) 
         "1. For questions about Jio services, plans, or FAQs, answer using ONLY the provided context.\n"
         "2. If the context does not contain the answer, say you couldn't find information about that in the Jio FAQs.\n"
         "3. Answer naturally and conversationally. Be concise.\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"Q: {question}"
+        f"CONTEXT:\n{context}\n"
     )
 
-def get_live_voice_general_prompt(memory_context: str, question: str) -> str:
+def get_live_voice_general_prompt(memory_context: str) -> str:
     mem_str = f"User Memory Context:\n{memory_context}\n" if memory_context else ""
     return (
         "You are a live voice/visual assistant. You can see through the user's camera if they are in camera mode. "
         f"{mem_str}"
-        "Answer naturally and conversationally. Be extremely concise. Do not output any reasoning, thinking, or `<think>` tags. Just provide the final direct answer immediately.\n\n"
-        f"Q: {question}"
+        "Answer naturally and conversationally. Be extremely concise. Do not output any reasoning, thinking, or `<think>` tags. Just provide the final direct answer immediately.\n"
     )
 
 def get_live_vision_query_prompt(question: str) -> str:
-    return f"The user asks: '{question}'. Describe what you see in the image to answer the question. Be concise and factual. Do not make things up."
+    return f"The user asks: '{question}'. Describe what you see to answer them. STRICT RULE: Output JSON with exactly 1 key 'description' containing a 1-sentence answer (max 15 words)."
 
 LIVE_VISION_SYSTEM_PROMPT = "You are a helpful live visual assistant. Answer concisely."
 
