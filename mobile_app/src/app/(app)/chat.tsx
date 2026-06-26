@@ -121,6 +121,7 @@ export default function ChatScreen() {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<any[]>([]);
   const [inputText, setInputText] = useState('');
+  const [selectedImage, setSelectedImage] = useState<ImagePicker.ImagePickerAsset | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -322,12 +323,20 @@ export default function ChatScreen() {
   };
 
   const handleSendText = async () => {
-    if (!inputText.trim()) return;
-    const userMsg = { id: Date.now().toString(), role: 'user', text: inputText };
+    if (!inputText.trim() && !selectedImage) return;
+    const currentImage = selectedImage;
+    const currentText = inputText.trim() || (currentImage ? "Describe this image." : "");
+    const userMsg = {
+      id: Date.now().toString(),
+      role: 'user',
+      text: currentText,
+      ...(currentImage && { image: `data:image/jpeg;base64,${currentImage.base64}` })
+    };
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
+    setSelectedImage(null);
     setIsLoading(true);
-    
+
     const currentSessionId = activeSessionIdRef.current;
 
     try {
@@ -348,7 +357,7 @@ export default function ChatScreen() {
         setMessages(prev => [...prev, { id: botMessageId, role: 'bot', text: '' }]);
         // Keep isLoading true or false depending on how we want the UI. Actually, streaming text is already replacing the spinner.
         // We'll leave isLoading true so the user knows it's working, but the text will stream in real-time.
-        
+
         const data: any = await sendChatMessage(userMsg.text, activeSessionId, (chunk) => {
           setMessages(prev => prev.map(m => {
             if (m.id === botMessageId) {
@@ -356,8 +365,8 @@ export default function ChatScreen() {
             }
             return m;
           }));
-        });
-        
+        }, currentImage?.base64);
+
         if (activeSessionIdRef.current !== currentSessionId) return;
 
         if (data.session_id && !activeSessionId) {
@@ -409,7 +418,7 @@ export default function ChatScreen() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://10.137.66.237:8000').replace('http', 'ws') + '/api/live/ws';
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://10.169.209.237:8000').replace('http', 'ws') + '/api/live/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -624,6 +633,18 @@ export default function ChatScreen() {
 
 
 
+  const pickImage = async () => {
+    let result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      base64: true,
+      quality: 0.5,
+    });
+
+    if (!result.canceled) {
+      setSelectedImage(result.assets[0]);
+    }
+  };
+
   const pickDocument = async () => {
     let result = await DocumentPicker.getDocumentAsync({ type: 'application/pdf' });
     if (!result.canceled) {
@@ -748,71 +769,89 @@ export default function ChatScreen() {
                 ) : null
               }
             />
+
+
+            <Animated.View style={[
+              animatedBorderStyle,
+              {
+                marginBottom: isKeyboardVisible ? 12 : Math.max(insets.bottom, 12),
+                marginHorizontal: 12,
+                borderRadius: 34,
+                padding: 2,
+              }
+            ]}>
+              <View style={[styles.inputArea, { marginBottom: 0, marginHorizontal: 0 }]}>
+                {isRecordingVoiceMessage ? (
+                  <View style={styles.voiceMessageBar}>
+                    <TouchableOpacity style={styles.iconBtn} onPress={cancelVoiceMessage}>
+                      <Feather name="trash-2" size={22} color="#ef4444" />
+                    </TouchableOpacity>
+                    <Text style={styles.recordingText}>Recording...</Text>
+                    <TouchableOpacity style={styles.sendBtn} onPress={sendVoiceMessage}>
+                      <Feather name="arrow-up" size={20} color="#fff" />
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <>
+                    <TouchableOpacity style={styles.iconBtn} onPress={() => setIsPlusMenuOpen(!isPlusMenuOpen)}>
+                      <Feather name="plus" size={24} color="#a1a1aa" />
+                    </TouchableOpacity>
+
+                    {selectedImage && (
+                      <View style={{ position: 'relative', marginHorizontal: 4 }}>
+                        <Image source={{ uri: selectedImage.uri }} style={{ width: 36, height: 36, borderRadius: 8 }} />
+                        <TouchableOpacity
+                          style={{ position: 'absolute', top: -6, right: -6, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 10, width: 20, height: 20, justifyContent: 'center', alignItems: 'center' }}
+                          onPress={() => setSelectedImage(null)}
+                        >
+                          <Feather name="x" size={14} color="#fff" />
+                        </TouchableOpacity>
+                      </View>
+                    )}
+
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Message..."
+                      placeholderTextColor="#a1a1aa"
+                      value={inputText}
+                      onChangeText={setInputText}
+                      onSubmitEditing={handleSendText}
+                    />
+
+                    {inputText.length === 0 && !selectedImage ? (
+                      <>
+                        <TouchableOpacity style={styles.iconBtn} onPress={startVoiceMessage}>
+                          <Feather name="mic" size={22} color="#a1a1aa" />
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={() => setIsVoiceMode(true)}>
+                          <MaterialIcons name="graphic-eq" size={24} color="#a1a1aa" />
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.iconBtn} onPress={() => router.push({ pathname: '/live' })}>
+                          <Feather name="video" size={24} color="#a1a1aa" />
+                        </TouchableOpacity>
+                      </>
+                    ) : (
+                      <TouchableOpacity style={styles.sendBtn} onPress={handleSendText}>
+                        <Feather name="arrow-up" size={20} color="#fff" />
+                      </TouchableOpacity>
+                    )}
+                  </>
+                )}
+              </View>
+            </Animated.View>
+
             {isPlusMenuOpen && (
               <View style={styles.plusMenu}>
+                <TouchableOpacity style={styles.menuItem} onPress={() => { setIsPlusMenuOpen(false); pickImage(); }}>
+                  <Feather name="image" size={20} color="#a855f7" />
+                  <Text style={styles.menuText}>Upload Photo</Text>
+                </TouchableOpacity>
                 <TouchableOpacity style={styles.menuItem} onPress={() => { setIsPlusMenuOpen(false); pickDocument(); }}>
                   <Feather name="file-text" size={20} color="#a855f7" />
                   <Text style={styles.menuText}>Upload Document</Text>
                 </TouchableOpacity>
               </View>
             )}
-
-            <Animated.View style={[
-              animatedBorderStyle, 
-              { 
-                marginBottom: isKeyboardVisible ? 12 : Math.max(insets.bottom, 12),
-                marginHorizontal: 12,
-                borderRadius: 34,
-                padding: 2, 
-              }
-            ]}>
-              <View style={[styles.inputArea, { marginBottom: 0, marginHorizontal: 0 }]}>
-              {isRecordingVoiceMessage ? (
-                <View style={styles.voiceMessageBar}>
-                  <TouchableOpacity style={styles.iconBtn} onPress={cancelVoiceMessage}>
-                    <Feather name="trash-2" size={22} color="#ef4444" />
-                  </TouchableOpacity>
-                  <Text style={styles.recordingText}>Recording...</Text>
-                  <TouchableOpacity style={styles.sendBtn} onPress={sendVoiceMessage}>
-                    <Feather name="arrow-up" size={20} color="#fff" />
-                  </TouchableOpacity>
-                </View>
-              ) : (
-                <>
-                  <TouchableOpacity style={styles.iconBtn} onPress={() => setIsPlusMenuOpen(!isPlusMenuOpen)}>
-                    <Feather name="plus" size={24} color="#a1a1aa" />
-                  </TouchableOpacity>
-
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Message..."
-                    placeholderTextColor="#a1a1aa"
-                    value={inputText}
-                    onChangeText={setInputText}
-                    onSubmitEditing={handleSendText}
-                  />
-
-                  {inputText.length === 0 ? (
-                    <>
-                      <TouchableOpacity style={styles.iconBtn} onPress={startVoiceMessage}>
-                        <Feather name="mic" size={22} color="#a1a1aa" />
-                      </TouchableOpacity>
-                      <TouchableOpacity style={styles.iconBtn} onPress={() => setIsVoiceMode(true)}>
-                        <MaterialIcons name="graphic-eq" size={24} color="#a1a1aa" />
-                      </TouchableOpacity>
-                      <TouchableOpacity style={styles.iconBtn} onPress={() => router.push({ pathname: '/live' })}>
-                        <Feather name="video" size={24} color="#a1a1aa" />
-                      </TouchableOpacity>
-                    </>
-                  ) : (
-                    <TouchableOpacity style={styles.sendBtn} onPress={handleSendText}>
-                      <Feather name="arrow-up" size={20} color="#fff" />
-                    </TouchableOpacity>
-                  )}
-                </>
-              )}
-              </View>
-            </Animated.View>
           </>
         )}
       </KeyboardAvoidingView>

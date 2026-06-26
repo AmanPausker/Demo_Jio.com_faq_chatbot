@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import asyncio
 from typing import Optional
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 from get_audio import generate_speech
 from get_transcript import transcribe_audio_file
@@ -122,15 +122,17 @@ def process_a2ui_messages(answer: str):
         try:
             city_match = re.search(r'"city"\s*:\s*"([^"]+)"', answer)
             temp_match = re.search(r'"temperature"\s*:\s*([\d\.]+)', answer)
+            condition_match = re.search(r'"condition"\s*:\s*"([^"]+)"', answer)
             
             if city_match:
                 city = city_match.group(1)
                 temp = temp_match.group(1) if temp_match else "unknown"
+                condition = condition_match.group(1) if condition_match else "unknown"
                 
                 props = {
                     "city": city,
                     "temperature": float(temp) if temp != "unknown" else None,
-                    "condition": "clear"
+                    "condition": condition
                 }
                 
                 spoken_text = f"The weather in {city} is {temp} degrees."
@@ -159,6 +161,7 @@ def process_a2ui_messages(answer: str):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    image_base64: Optional[str] = None
 
 
 @server.post("/api/chat")
@@ -199,6 +202,43 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
     }
 
     async def event_generator():
+        nonlocal user_message
+        if request.image_base64:
+            try:
+                logger.info(f"[VISION] Received image_base64 length={len(request.image_base64)}")
+                yield f"data: {json.dumps({'type': 'token', 'payload': ''})}\n\n"
+                prompt = user_message if user_message else "What is shown in this image?"
+                full_answer = await query_qwen_vision(
+                    prompt, request.image_base64,
+                    max_tokens=512,
+                    system_override="Answer the user's question directly based on the image. Be concise."
+                )
+                logger.info(f"[VISION] Qwen Vision response: {full_answer}")
+                full_answer = full_answer.strip()
+
+                new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(full_answer)
+
+                final_payload = json.dumps({
+                    "type": "final",
+                    "text": new_answer,
+                    "audio_base64": None,
+                    "a2ui_messages": a2ui_msgs,
+                    "surface_id": surface_id,
+                    "session_id": thread_id
+                })
+                yield f"data: {final_payload}\n\n"
+
+                async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+                    langgraph_app = workflow.compile(checkpointer=memory)
+                    await langgraph_app.aupdate_state(
+                        config,
+                        {"messages": [HumanMessage(content=f"[Attached Image] {prompt}"), AIMessage(content=full_answer)]}
+                    )
+            except Exception as e:
+                logger.error(f"[VISION API] error: {e}")
+                yield f"data: {json.dumps({'type': 'token', 'payload': '[Error analyzing image] '})}\n\n"
+            return
+
         from langchain_core.messages import AIMessageChunk
         async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
             langgraph_app = workflow.compile(checkpointer=memory)
@@ -220,7 +260,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
             state = await langgraph_app.aget_state(config)
             if state and hasattr(state, "values"):
                 router_val = state.values.get("router", "unknown")
-                answer = full_answer or state.values.get("answer", "")
+                answer = state.values.get("answer", "") or full_answer
             else:
                 answer = full_answer
                 
@@ -396,6 +436,18 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
     except Exception as e:
         logger.error(f"[UPLOAD] Failed: file={file.filename} user={user_id} error={e}")
         return {"error": f"Failed to process file: {str(e)}"}
+
+
+@server.post("/api/vision")
+async def vision_upload(file: UploadFile = File(...), user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    try:
+        image_bytes = await file.read()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        text = await query_qwen_vision("What is shown in this image?", base64_image)
+        return {"success": True, "text": text}
+    except Exception as e:
+        logger.error(f"[VISION UPLOAD] error: {e}")
+        return {"success": False, "error": str(e)}
 
 
 OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
@@ -610,36 +662,88 @@ def scene_changed(frame_b64: str, last_hashes: tuple,
     return changes >= 2, new_hashes
 
 
-async def query_qwen_vision(prompt: str, base64_image: str) -> str:
+async def query_qwen_vision(prompt: str, base64_image: str,
+                           max_tokens: int = 1024, system_override: str = None) -> str:
+    import io
+    from PIL import Image
     import aiohttp
     import json
+
+    img_data = base64.b64decode(base64_image)
+    img = Image.open(io.BytesIO(img_data))
+    img.thumbnail((512, 512))
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    out_io = io.BytesIO()
+    img.save(out_io, format='JPEG', quality=85)
+    compressed_b64 = base64.b64encode(out_io.getvalue()).decode('utf-8')
+
     url = "http://localhost:11434/api/chat"
+    system_text = system_override or 'Output ONLY valid JSON in this exact format: {"description": "1 short sentence max 15 words"}'
     payload = {
         "model": "qwen-vision",
+        "format": "json",
         "messages": [
+            {
+                "role": "system",
+                "content": system_text
+            },
             {
                 "role": "user",
                 "content": prompt,
-                "images": [base64_image]
+                "images": [compressed_b64]
+            },
+            {
+                "role": "assistant",
+                "content": '{"description": "'
             }
         ],
-        "options": {"think": False},
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": 0.1 # Decreased the temperature of the llm to strict more of deterministic responses and faster.
+        },
         "stream": False
     }
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with sess.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
+                if "error" in data:
+                    logger.error(f"[VISION API] Ollama returned error: {data['error']}")
+                    return f"[Vision unavailable: {data['error']}]"
                 msg = data.get("message", {})
-                return msg.get("content", "").strip()
+                content = msg.get("content", "").strip()
+                if not content:
+                    content = msg.get("thinking", "").strip()
+                
+                # Prepend the prefill since Ollama returns the continuation
+                # This is required because qwen3.5 is reasoning model and is programmed to always reason and output the reasoning.
+                # It creates <think> </think> tags and outputs the reasoning and thus increases the latency of responses.
+                # To avoid this - We prefill the response with '{"description": "' and check for the same.
+                # This reduced the vision-llm's response latency from >22seconds to <5seconds.
+
+                if not content.startswith("{"):
+                    full_json_str = '{"description": "' + content
+                else:
+                    full_json_str = content
+
+                # Try to parse as JSON
+                try:
+                    parsed = json.loads(full_json_str)
+                    if "description" in parsed:
+                        content = parsed["description"]
+                except Exception:
+                    pass
+
+                logger.info(f"[VISION API] response ({len(base64_image)}b img): {content[:200]}")
+                return content
     except Exception as e:
-        logger.debug(f"[VISION API] error: {e}")
+        live_logger.error(f"[VISION API] error: {e}")
         return f"[Vision unavailable: {e}]"
 
 async def analyze_scene_background(session: Session):
-    """Background task to analyze scene changes when user starts speaking."""
-    if not session.frame_buffer:
-        return
+    """Background task disabled since we query vision synchronously per question now."""
+    return
     if session.is_analyzing_vision:
         return
         
@@ -665,7 +769,7 @@ async def analyze_scene_background(session: Session):
             img.save(out_io, format='JPEG', quality=85)
             compressed_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
             
-            prompt = "Describe the current scene and any objects or people present briefly."
+            prompt = 'Describe the current scene and objects present briefly. STRICT RULE: Output JSON with exactly 1 key "description" containing a 1-sentence answer (max 15 words).'
             desc = await query_qwen_vision(prompt, compressed_frame)
             if desc and not desc.startswith("[Vision unavailable"):
                 session.cached_visual_desc = desc
@@ -714,9 +818,9 @@ def needs_visual_context(question: str) -> bool:
 
 def build_live_prompt(session: Session, question: str, context: str = "", memory_context: str = "") -> str:
     if context:
-        return get_live_voice_jio_prompt(memory_context, context, question)
+        return get_live_voice_jio_prompt(memory_context, context)
     else:
-        return get_live_voice_general_prompt(memory_context, question)
+        return get_live_voice_general_prompt(memory_context)
 
 
 async def _send_tts_filler(websocket: WebSocket, text: str):
@@ -779,18 +883,27 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     session.is_processing = True
     session.conversation_history.append({"role": "user", "content": question})
 
-    needs_vision = needs_visual_context(question)
+    needs_vision = True
     
     # 1. Fetch Retrieval Context from Neo4j/Qdrant
-    from nodes import retrieve_node
-    state = {"question": question, "user_id": session.user_id, "messages": []}
-    config = {"configurable": {"thread_id": session.session_id}}
-    try:
-        retrieval_res = await asyncio.to_thread(retrieve_node, state, config)
-        retrieved_context = retrieval_res.get("context", "")
-    except Exception as e:
-        logger.debug(f"Live retrieval error: {e}")
-        retrieved_context = ""
+    retrieved_context = ""
+    
+    # Only fetch retrieval context if we are in live-audio-chat (no video frames)
+    if not session.frame_buffer:
+        try:
+            from nodes import retrieve_node
+            from langchain_core.messages import HumanMessage as _HM
+            config = {"configurable": {"thread_id": session.session_id}}
+            retrieve_state = {
+                "question": question,
+                "messages": [_HM(content=question)],
+                "context": "", "answer": "",
+                "user_id": session.user_id, "token": getattr(session, "token", "")
+            }
+            retrieval_result = await asyncio.to_thread(retrieve_node, retrieve_state, config)
+            retrieved_context = retrieval_result.get("context", "")
+        except Exception as e:
+            live_logger.error(f"[RETRIEVAL ERROR] {e}")
 
     memory_context = ""
     from nodes import fetch_user_memories
@@ -810,29 +923,25 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
 
             try:
                 t_vision = time.time()
-                if session.cached_visual_desc and (time.time() - session.cached_visual_time < 10.0):
-                    visual_desc = session.cached_visual_desc
-                    logger.debug(f"[LATENCY] Used cached vision desc (age: {time.time() - session.cached_visual_time:.1f}s)")
-                else:
-                    # Compress image before sending
-                    try:
-                        from PIL import Image
-                        import io
-                        img_data = base64.b64decode(latest_frame)
-                        img = Image.open(io.BytesIO(img_data))
-                        img.thumbnail((512, 512))
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        out_io = io.BytesIO()
-                        img.save(out_io, format='JPEG', quality=85)
-                        latest_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
-                    except Exception as resize_err:
-                        logger.debug(f"Image resize error: {resize_err}")
+                # Compress image before sending
+                try:
+                    from PIL import Image
+                    import io
+                    img_data = base64.b64decode(latest_frame)
+                    img = Image.open(io.BytesIO(img_data))
+                    img.thumbnail((512, 512))
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    out_io = io.BytesIO()
+                    img.save(out_io, format='JPEG', quality=85)
+                    latest_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
+                except Exception as resize_err:
+                    live_logger.error(f"[VISION] Image resize error: {resize_err}")
 
-                    import random
-                    asyncio.create_task(_send_tts_filler(websocket, random.choice(_FILLER_PHRASES)))
-                    prompt = get_live_vision_query_prompt(question)
-                    visual_desc = await asyncio.wait_for(query_qwen_vision(prompt, latest_frame), timeout=7.0)
+                import random
+                asyncio.create_task(_send_tts_filler(websocket, random.choice(_FILLER_PHRASES)))
+                prompt = get_live_vision_query_prompt(question)
+                visual_desc = await asyncio.wait_for(query_qwen_vision(prompt, latest_frame), timeout=45.0)
                 
                 vision_latency = (time.time() - t_vision) * 1000
                 logger.debug(f"[LATENCY] Vision processing took {vision_latency:.0f}ms")
@@ -842,25 +951,23 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                     f"response='{visual_desc[:200]}'"
                 )
             except Exception as e:
-                logger.debug(f"Vision error type: {type(e)}, error: {repr(e)}")
+                live_logger.error(f"[VISION ERROR] type={type(e).__name__} error={repr(e)}")
                 live_logger.error(
                     f"[VISION] FAILED: user={session.user_id} session={session.session_id} "
                     f"error='{repr(e)}'"
                 )
                 visual_desc = f"[Vision unavailable: {e}]"
 
-            final_prompt = get_live_vision_final_prompt(prompt_text, visual_desc)
-            messages = [
-                {"role": "system", "content": LIVE_VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": final_prompt}
-            ]
+            skip_primary_llm = True
+
         else:
+            skip_primary_llm = False
             from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
             
             messages = [SystemMessage(content=prompt_text)]
             last_role = "system"
             
-            for msg in session.conversation_history[-6:]:
+            for msg in session.conversation_history[-3:]:
                 role = "user" if msg["role"] == "user" else "assistant"
                 content = msg["content"]
                 
@@ -889,8 +996,14 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             }
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        logger.error(f"[OLLAMA ERROR] Status {resp.status}: {err_text}")
+                        return
                     async for line in resp.content:
                         line = line.decode('utf-8').strip()
+                        if not line:
+                            continue
                         if line.startswith("data: ") and line != "data: [DONE]":
                             try:
                                 data = json.loads(line[6:])
@@ -905,8 +1018,13 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             sentence_buffer = ""
             t_llm = time.time()
             first_token = True
+            
+            async def text_to_stream(text):
+                yield text, ""
+                
             try:
-                async for content_token, reasoning_token in custom_ollama_stream(messages):
+                stream_source = text_to_stream(visual_desc) if skip_primary_llm else custom_ollama_stream(messages)
+                async for content_token, reasoning_token in stream_source:
                     if not session.is_processing or session.current_response_id != my_response_id:
                         logger.debug("[STREAM] LLM interrupted by barge-in.")
                         break
@@ -928,7 +1046,11 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                     except Exception:
                         break
                     stripped = sentence_buffer.strip()
-                    if stripped and stripped[-1] in SENTENCE_ENDINGS and len(stripped) >= MIN_SENTENCE_LEN:
+                    is_sentence_end = stripped and stripped[-1] in SENTENCE_ENDINGS
+                    is_newline = '\n' in token
+                    is_too_long = len(stripped) > 400
+                    
+                    if stripped and len(stripped) >= MIN_SENTENCE_LEN and (is_sentence_end or is_newline or is_too_long):
                         task = asyncio.create_task(fetch_tts_sentence(stripped))
                         await tts_queue.put(task)
                         sentence_buffer = ""
@@ -975,11 +1097,17 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
 
         await asyncio.gather(llm_producer(), tts_consumer())
 
+        if not full_answer and (not session.is_processing or session.current_response_id != my_response_id):
+            # It was interrupted before it could generate anything!
+            # Abort gracefully without polluting history or UI.
+            live_logger.info(f"[ABORT] user={session.user_id} question='{question[:30]}' (Interrupted before LLM response)")
+            return
+
         answer = full_answer or "I'm having trouble thinking right now. Please try again."
         session.conversation_history.append({"role": "assistant", "content": answer})
 
         live_logger.info(
-            f"[PRIMARY LLM] user={session.user_id} session={session.session_id} "
+            f"[FINAL ANSWER] user={session.user_id} session={session.session_id} "
             f"question='{question[:80]}' "
             f"total_ms={(time.time() - t_start)*1000:.0f} "
             f"answer='{answer[:200]}'"
@@ -988,18 +1116,19 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
         try:
             await websocket.send_json({"type": "assistant_response", "payload": answer})
         except Exception as ws_err:
-            logger.debug(f"WebSocket send error (assistant_response): {ws_err}")
+            live_logger.error(f"[WS] Send error (assistant_response): {ws_err}")
 
-        logger.debug(f"[LATENCY] Total question→done: {(time.time() - t_start)*1000:.0f}ms")
+        logger.info(f"[LATENCY] Total question→done: {(time.time() - t_start)*1000:.0f}ms")
 
     except Exception as e:
-        logger.debug(f"Error handling question: {e}")
+        live_logger.error(f"[PRIMARY LLM] Error handling question: {repr(e)}")
         try:
             await websocket.send_json({"type": "error", "payload": "Failed to generate response"})
         except Exception:
             pass
 
-    session.is_processing = False
+    if session.current_response_id == my_response_id:
+        session.is_processing = False
 
 
 import torch
@@ -1102,7 +1231,6 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
         if result:
             if "start" in result:
                 logger.info(f"[VAD] Speech started")
-                session.is_processing = False
                 asyncio.create_task(analyze_scene_background(session))
                 if getattr(session, "tts_track", None):
                     session.tts_track.clear_queue()

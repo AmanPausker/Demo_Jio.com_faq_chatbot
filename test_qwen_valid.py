@@ -18,10 +18,11 @@ async def test_api():
         "messages": [
             {
                 "role": "user",
-                "content": "What color is this image?",
+                "content": f"System Instruction: Answer directly in 1-2 sentences with no reasoning, analysis, or thinking.\n\nUser Question: What color is this image?",
                 "images": [valid_b64]
             }
         ],
+        "options": {"num_predict": 256},
         "stream": False
     }
 
