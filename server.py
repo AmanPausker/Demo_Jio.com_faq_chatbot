@@ -56,8 +56,16 @@ SUPABASE_ANON_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 from file_workflow import converter_pdf, create_chunking, create_embeddings, store_in_qdrant
+import datetime
 
-
+async def save_messages_to_supabase(token: str, session_id: str, user_msg: str, ai_msg: str, a2ui_msgs: list):
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    now = datetime.utcnow().isoformat()
+    rows = [
+        {"session_id": session_id, "role": "user", "content": user_msg, "a2ui": None, "created_at": now},
+        {"session_id": session_id, "role": "ai", "content": ai_msg, "a2ui": json.dumps(a2ui_msgs) if a2ui_msgs else None, "created_at": now},
+    ]
+    user_supabase.table("chat_messages").insert(rows).execute()
 def get_token(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
@@ -96,7 +104,7 @@ def process_pdf_background(temp_file_path: str, filename: str, user_id: str, ses
             os.remove(temp_file_path)
 def generate_session_title_bg(session_id: str, user_id:str, token : str, user_message:str):
     try:
-        user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options =ClientOptions(headers = {"Authorization":f"Bearer{token}"}))
+        user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options =ClientOptions(headers = {"Authorization":f"Bearer {token}"}))
         from langchain_ollama import ChatOllama
         from langchain_core.messages import SystemMessage, HumanMessage
         client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False)
@@ -231,9 +239,11 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                 async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
                     langgraph_app = workflow.compile(checkpointer=memory)
                     await langgraph_app.aupdate_state(
+                        
                         config,
                         {"messages": [HumanMessage(content=f"[Attached Image] {prompt}"), AIMessage(content=full_answer)]}
                     )
+                    await save_messages_to_supabase(token, request.session_id, user_message, new_answer, a2ui_msgs)
             except Exception as e:
                 logger.error(f"[VISION API] error: {e}")
                 yield f"data: {json.dumps({'type': 'token', 'payload': '[Error analyzing image] '})}\n\n"
@@ -274,7 +284,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
             background_tasks.add_task(summarize_short_term_memory_bg, thread_id)
             
             new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
-            
+            await save_messages_to_supabase(token, request.session_id, user_message, new_answer, a2ui_msgs)
             final_payload = json.dumps({
                 "type": "final",
                 "text": new_answer,
@@ -308,31 +318,23 @@ async def get_session_history(session_id: str, user_id: str = Depends(get_curren
         raise HTTPException(status_code=403, detail="Session not found or access denied")
 
     config = {"configurable": {"thread_id": session_id}}
-    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
-        langgraph_app = workflow.compile(checkpointer=memory)
-        state = await langgraph_app.aget_state(config)
+    res = user_supabase.table("chat_messages")\
+        .select("*")\
+        .eq("session_id", session_id)\
+        .order("created_at")\
+        .execute()
 
     messages = []
-    if state and hasattr(state, "values") and "messages" in state.values:
-        for msg in state.values["messages"]:
-            content = msg.content
-            a2ui_msgs = []
-
-            if msg.type != "human":
-                new_text, _, parsed_a2ui, _ = process_a2ui_messages(content)
-                if parsed_a2ui:
-                    content = new_text
-                    a2ui_msgs = parsed_a2ui
-
-            messages.append({
-                "type": "user" if msg.type == "human" else "ai",
-                "content": content,
-                "a2ui_messages": a2ui_msgs
-            })
+    for msg in res.data:
+        a2ui = json.loads(msg["a2ui"]) if msg.get("a2ui") else []
+        messages.append({
+            "type": msg["role"],
+            "content": msg["content"],
+            "a2ui_messages": a2ui
+        })
 
     return {"history": messages}
-
-
+    
 @server.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
     user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
@@ -406,6 +408,7 @@ async def chat_audio(background_tasks: BackgroundTasks, audio: UploadFile = File
     background_tasks.add_task(summarize_short_term_memory_bg, thread_id)
         
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
+    await save_messages_to_supabase(token, session_id, user_message, new_answer, a2ui_msgs)
     logger.info(f"[AUDIO] Done: user={user_id} session={session_id} transcript_len={len(user_message)} answer_len={len(answer)}")
 
     b64_audio = await generate_speech(spoken_text, return_base64=True)
@@ -741,44 +744,7 @@ async def query_qwen_vision(prompt: str, base64_image: str,
         live_logger.error(f"[VISION API] error: {e}")
         return f"[Vision unavailable: {e}]"
 
-async def analyze_scene_background(session: Session):
-    """Background task disabled since we query vision synchronously per question now."""
-    return
-    if session.is_analyzing_vision:
-        return
-        
-    now = time.time()
-    if now - session.last_analysis_time < MIN_ANALYSIS_INTERVAL:
-        return
-        
-    session.is_analyzing_vision = True
-    session.last_analysis_time = now
-    latest_frame = session.frame_buffer[-1]
-    try:
-        changed, new_hashes = scene_changed(latest_frame, session.last_region_hashes)
-        if changed or not session.cached_visual_desc:
-            session.last_region_hashes = new_hashes
-            # Compress image
-            import io
-            from PIL import Image
-            img_data = base64.b64decode(latest_frame)
-            img = Image.open(io.BytesIO(img_data))
-            img.thumbnail((512, 512))
-            if img.mode != 'RGB': img = img.convert('RGB')
-            out_io = io.BytesIO()
-            img.save(out_io, format='JPEG', quality=85)
-            compressed_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
-            
-            prompt = 'Describe the current scene and objects present briefly. STRICT RULE: Output JSON with exactly 1 key "description" containing a 1-sentence answer (max 15 words).'
-            desc = await query_qwen_vision(prompt, compressed_frame)
-            if desc and not desc.startswith("[Vision unavailable"):
-                session.cached_visual_desc = desc
-                session.cached_visual_time = time.time()
-                logger.info(f"[BG VISION] Updated scene desc: {desc[:100]}...")
-    except Exception as e:
-        logger.debug(f"[BG VISION] error: {e}")
-    finally:
-        session.is_analyzing_vision = False
+
 
 def needs_visual_context(question: str) -> bool:
     q = question.lower().strip()
@@ -848,30 +814,17 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     import asyncio
 
     filler_phrases = [
-        'Thinking...', 'Analyzing request...', 'Formulating response...', 'Processing input...',
-        'Evaluating context...', 'Generating text...', 'Retrieving data...', 'Synthesizing information...',
-        'Connecting concepts...', 'Drafting reply...', 'Checking logic...', 'Reviewing parameters...',
-        'Parsing intent...', 'Calculating probabilities...', 'Structuring answer...', 'Decoding message...',
-        'Aligning knowledge base...', 'Cross-referencing memory...', 'Extracting key points...', 'Refining language...',
-        'Polishing syntax...', 'Optimizing tone...', 'Searching archives...', 'Scanning databases...',
-        'Correlating facts...', 'Assembling variables...', 'Constructing logic gates...', 'Evaluating pathways...',
-        'Simulating outcomes...', 'Translating thoughts...', 'Balancing algorithms...', 'Computing response...',
-        'Interpreting query...', 'Weighing options...', 'Calibrating context...', 'Filtering noise...',
-        'Isolating signals...', 'Mapping connections...', 'Navigating knowledge graph...', 'Validating hypotheses...',
-        'Compiling data...', 'Structuring narrative...', 'Formatting output...', 'Applying heuristics...',
-        'Inferring meaning...', 'Deducing answer...', 'Reasoning through prompt...', 'Distilling concepts...',
-        'Abstracting details...', 'Summarizing thoughts...', 'Gathering insights...', 'Activating neural pathways...',
-        'Running diagnostics...', 'Checking heuristics...', 'Verifying statements...', 'Analyzing semantics...',
-        'Deconstructing query...', 'Reconstructing context...', 'Formulating hypothesis...', 'Generating possibilities...',
-        'Selecting optimal response...', 'Drafting logic...', 'Evaluating coherence...', 'Checking consistency...',
-        'Ensuring accuracy...', 'Validating sources...', 'Structuring arguments...', 'Weighing evidence...',
-        'Formulating conclusion...', 'Polishing draft...', 'Refining nuances...', 'Adjusting parameters...',
-        'Optimizing clarity...', 'Enhancing readability...', 'Checking constraints...', 'Verifying limits...',
-        'Applying logic...', 'Reasoning...', 'Pondering...', 'Deliberating...', 'Contemplating...',
-        'Considering...', 'Reflecting...', 'Analyzing...', 'Processing...', 'Computing...',
-        'Calculating...', 'Evaluating...', 'Assessing...', 'Reviewing...', 'Checking...',
-        'Verifying...', 'Validating...', 'Correlating...', 'Synthesizing...', 'Integrating...',
-        'Connecting...', 'Structuring...', 'Formatting...', 'Finalizing...'
+        'Let me wrap my head around this...', 'Connecting the dots...', 'Pulling this together...', 'Digging into this...',
+        'Mapping out the best approach...', 'Let me see what we have here...', 'Piecing it together...', 'Looking from a few angles...',
+        'Rummaging through the digital attic...', 'Bribing the server hamsters...', 'Dusting off the encyclopedias...', 'Asking the Magic 8-Ball...',
+        'Brewing some fresh data...', 'Waking up the algorithms...', 'Flipping through the infinite library...', 'Untangling the spaghetti code...',
+        'Spooling up the quantum drives...', 'Jacking into the mainframe...', 'Realigning the optical matrices...', 'Decrypting the archives...',
+        'Pinging the outer rim...', 'Calibrating the neural net...', 'Bypassing the firewall...', 'Synchronizing local nodes...',
+        'Consulting the archives...', 'Distilling the essentials...', 'Charting the approach...', 'Curating the best options...',
+        'Assembling the framework...', 'Reviewing the parameters...', 'Drafting the blueprint...', 'Aligning the variables...',
+        'Consulting the ancient scrolls...', 'Gazing into the orb...', 'Casting a revelation spell...', 'Listening to network whispers...',
+        'Summoning the answers...', 'Brewing the elixir of knowledge...', 'Translating the runes...', 'Putting the pieces into place...',
+        'Weighing the possibilities...', 'Finding the signal in the noise...', 'Separating fact from fiction...', 'Building the perfect response...'
     ]
     chosen_phrase = random.choice(filler_phrases)
     # 1. Send the filler word to UI immediately- 
@@ -1274,7 +1227,34 @@ async def handle_incoming_track(session: Session, track, websocket: WebSocket):
         except Exception as e:
             logger.error(f"[WebRTC] track ended with error: {e}")
             break
+async def handle_incoming_video_track(session: Session, track):
+    import io
+    import base64
+    import time
+    from PIL import Image
 
+    last_frame_time = 0
+    FRAME_INTERVAL = 2.0
+
+    while True:
+        try:
+            frame = await track.recv()
+            now = time.time()
+            if now - last_frame_time >= FRAME_INTERVAL:
+                last_frame_time = now
+                img = frame.to_image()
+                img.thumbnail((512, 512))
+                if img.mode != "RGB":
+                    img = img.convert('RGB')
+                out_io = io.BytesIO()
+
+                img.save(out_io, format = "JPEG", quality = 85)
+                compressed_frame = base64.b64encode(out_io.getvalue()).decode('utf-8')
+                session.frame_buffer.append(compressed_frame)
+                session.touch()
+
+        except Exception as e: #Track ended or connection closed
+            break 
 @server.websocket("/api/live/ws")
 async def live_chat_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -1373,6 +1353,8 @@ async def live_chat_websocket(websocket: WebSocket):
                         def on_track(track):
                             if track.kind == "audio":
                                 asyncio.create_task(handle_incoming_track(session, track, websocket))
+                            elif track.kind == "video":
+                                asyncio.create_task(handle_incoming_video_track(session, track))
 
                     offer = RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
                     await session.pc.setRemoteDescription(offer)

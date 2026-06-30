@@ -17,7 +17,7 @@ from system_instructions import (
 from logger import logger
 load_dotenv(override=True)
 from langchain_ollama import ChatOllama
-client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
+client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", temperature = 0.2 , think=False, streaming=True, num_ctx=8192)
 from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
@@ -36,7 +36,7 @@ WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 from langchain_core.tools import tool
 
 async def general_generation_node(State: GraphState):
-    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", temperature =0.7, think=False, streaming=True, num_ctx=8192)
 
     tools = [get_weather, get_current_location]
     question = State.get("question", "").lower()

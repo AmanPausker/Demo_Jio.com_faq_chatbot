@@ -1,11 +1,11 @@
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import { useCameraPermissions } from 'expo-camera';
+import { RTCPeerConnection, RTCSessionDescription, mediaDevices, RTCView } from 'react-native-webrtc';
 import { Audio } from 'expo-av';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Feather } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
-import { RTCPeerConnection, RTCSessionDescription, mediaDevices } from 'react-native-webrtc';
 import { supabase } from '../../utils/supabaseClient';
 import { WaveAnimation, WaveType } from '../../components/WaveAnimation';
 
@@ -17,7 +17,7 @@ export default function LiveChatScreen() {
   const cameraRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
-
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const activeSessionIdRef = useRef(Date.now().toString());
 
@@ -69,17 +69,6 @@ export default function LiveChatScreen() {
             payload: { token: session.access_token, session_id: activeSessionIdRef.current }
           }));
 
-          // Start Video Loop (0.5 FPS)
-          frameInterval = setInterval(async () => {
-            if (!mounted || !cameraRef.current) return;
-            try {
-              const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.5, shutterSound: false });
-              if (photo && photo.base64 && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "video_frame", payload: photo.base64 }));
-              }
-            } catch (e) { }
-          }, 2000);
-
           // Start streaming audio via WebRTC
           startWebRTC(ws);
         };
@@ -124,8 +113,20 @@ export default function LiveChatScreen() {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       pcRef.current = pc;
 
-      const stream = await mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+      let videoSourceId;
+      try {
+        const devices = await mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(d => d.kind === 'videoinput');
+        const backCamera = videoDevices.find(d => d.facing === 'environment' || d.facingMode === 'environment');
+        videoSourceId = backCamera ? backCamera.deviceId : (videoDevices[0] ? videoDevices[0].deviceId : undefined);
+      } catch (e) { console.log(e); }
+
+      const stream = await mediaDevices.getUserMedia({ 
+        audio: { echoCancellation: true, noiseSuppression: true }, 
+        video: videoSourceId ? { deviceId: videoSourceId } : { facingMode: 'environment'} 
+      });
       localStreamRef.current = stream;
+      setStreamUrl(stream.toURL());
 
       stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
 
@@ -217,7 +218,7 @@ export default function LiveChatScreen() {
 
   return (
     <View style={styles.container}>
-      <CameraView style={styles.camera} facing="back" ref={cameraRef} />
+      {streamUrl ? (<RTCView streamURL={streamUrl} style={styles.camera} objectFit="cover" />) : (<View style={styles.camera} />)}
       <View style={[styles.overlay, StyleSheet.absoluteFillObject]}>
         <View style={styles.header}>
           <TouchableOpacity onPress={() => router.replace('/chat')} style={styles.backBtn}>
