@@ -399,8 +399,9 @@ export default function ChatScreen() {
         }));
         if (data.audio_base64) playAudioBase64(data.audio_base64);
       }
-    } catch (e) {
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'bot', text: 'Sorry, I encountered an error.' }]);
+    } catch (e: any) {
+      const errorMsg = e.message ? `Error: ${e.message}` : 'Sorry, I encountered an error.';
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'bot', text: errorMsg }]);
     } finally {
       setIsLoading(false);
     }

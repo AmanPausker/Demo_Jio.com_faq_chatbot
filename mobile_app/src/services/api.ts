@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
+import { generateLocalResponse } from './localLlama';
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.169.209.237:8000';
 
@@ -47,71 +48,58 @@ export const loadSessionHistory = async (sessionId: string) => {
 import EventSource from 'react-native-sse';
 
 export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void, imageBase64?: string) => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const headers = await getHeaders();
-      
-      const es = new EventSource(`${API_URL}/api/chat`, {
-        method: 'POST',
-        headers: {
-          ...headers,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: text,
-          session_id: sessionId,
-          image_base64: imageBase64
-        }),
-      });
-
-      es.addEventListener('message', (event) => {
-        if (event.data) {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'token') {
-              if (onChunk) onChunk(data.payload);
-            } else if (data.type === 'final') {
-              es.close();
-              resolve(data);
-            }
-          } catch (e) {
-            console.error('SSE JSON parse error', e);
-          }
-        }
-      });
-
-      es.addEventListener('error', (event) => {
-        if (event.type === 'error') {
-          console.error('SSE error:', event.message);
-          es.close();
-          if ((event as any).message?.includes('401')) {
-            resolve({ text: "Your session has expired. Please log out from the sidebar and log back in." });
-          } else {
-            reject(new Error(event.message || 'SSE Error'));
-          }
-        }
-      });
-    } catch (error: any) {
-      if (error.response?.status === 401) {
-        console.warn('Unauthorized: Failed to send message');
-        resolve({ text: "Your session has expired. Please log out from the sidebar and log back in." });
-      } else {
-        console.error('Failed to send message:', error);
-        reject(error);
+  try {
+    const headers = await getHeaders();
+    
+    // Step 1: Hit the Prep Endpoint
+    const prepResponse = await axios.post(`${API_URL}/api/chat/prepare`, {
+      message: text,
+      session_id: sessionId,
+    }, {
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
       }
+    });
+    
+    // Step 2: Get the Prompt
+    const { prompt, context } = prepResponse.data;
+    
+    // Step 3: Run Local Inference
+    const finalAnswer = await generateLocalResponse(prompt + "\n\nUser: " + text, (token) => {
+      if (onChunk) onChunk(token);
+    });
+    
+    // Step 4: Return 
+    // We mock the properties that the frontend expects from the old API
+    return {
+      text: finalAnswer,
+      session_id: sessionId,
+      audio_base64: null,
+      a2ui_messages: [], // Real app would extract WeatherCard JSON here
+      surface_id: `chat_${Date.now()}`
+    };
+
+  } catch (error: any) {
+    if (error.response?.status === 401) {
+      console.warn('Unauthorized: Failed to send message');
+      return { text: "Your session has expired. Please log out from the sidebar and log back in." };
+    } else {
+      console.error('Failed to send message:', error);
+      throw new Error(`Failed: ${error.message || "Unknown error"}`);
     }
-  });
+  }
 };
 
 export const sendAudioMessage = async (audioUri: string, sessionId: string | null) => {
   try {
     const headers = await getHeaders();
-    
+
     const parameters: Record<string, string> = {};
     if (sessionId) {
       parameters['session_id'] = sessionId;
     }
-    
+
     const uploadTask = await FileSystem.uploadAsync(
       `${API_URL}/api/chat/audio`,
       audioUri,
@@ -126,7 +114,7 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
         parameters
       }
     );
-    
+
     if (uploadTask.status === 401) {
       console.warn('Unauthorized: Failed to send audio');
       return { text: "Your session has expired. Please log out from the sidebar and log back in." };
@@ -134,7 +122,7 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
     if (uploadTask.status !== 200) {
       throw new Error(`HTTP error! status: ${uploadTask.status}`);
     }
-    
+
     return JSON.parse(uploadTask.body);
   } catch (error) {
     console.error('Failed to send audio:', error);
@@ -145,7 +133,7 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
 export const uploadFile = async (fileUri: string, fileName: string, sessionId: string) => {
   try {
     const headers = await getHeaders();
-    
+
     const parameters: Record<string, string> = {};
     if (sessionId) {
       parameters['session_id'] = sessionId;
@@ -165,7 +153,7 @@ export const uploadFile = async (fileUri: string, fileName: string, sessionId: s
         parameters
       }
     );
-    
+
     if (uploadTask.status === 401) {
       console.warn('Unauthorized: Failed to upload file');
       return { error: "Your session has expired. Please log out and log back in." };
@@ -173,7 +161,7 @@ export const uploadFile = async (fileUri: string, fileName: string, sessionId: s
     if (uploadTask.status !== 200) {
       throw new Error(`HTTP error! status: ${uploadTask.status}`);
     }
-    
+
     return JSON.parse(uploadTask.body);
   } catch (error) {
     console.error('Upload error', error);

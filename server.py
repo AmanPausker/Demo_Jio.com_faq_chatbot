@@ -42,7 +42,10 @@ async def lifespan(app: FastAPI):
     manager.start_cleanup(ttl_seconds=600)
     yield
 
+from fastapi.staticfiles import StaticFiles
+
 server = FastAPI(title="Jio FAQ Bot API", lifespan=lifespan)
+server.mount("/public", StaticFiles(directory="public"), name="public")
 from app import workflow
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -298,6 +301,48 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
     from fastapi.responses import StreamingResponse
     return StreamingResponse(event_generator(), media_type="text/event-stream", background=background_tasks)
 
+@server.post("/api/chat/prepare")
+async def prepare_chat(request: ChatRequest, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    state = {"question": request.message}
+    config = {"configurable": {"thread_id": request.session_id or user_id}}
+    
+    from nodes import retrieve_node, fetch_user_memories
+    from system_instructions import get_general_generation_prompt, get_faq_generation_prompt
+    
+    # retrieve_node returns a Python dictionary, not an object
+    router_response = retrieve_node(state, config)
+    context = router_response.get("context", "")
+    router = router_response.get("router", 1)
+    
+    #fetch the user memories!
+    memory_context = fetch_user_memories(user_id, token)
+
+    if router == 1:
+        # You need to assign the result of the function to the 'system_prompt' variable
+        system_prompt = get_general_generation_prompt(memory_context)
+    else:
+        system_prompt = get_faq_generation_prompt(memory_context, context)
+        
+    return {"prompt": system_prompt, "router": router, "context": context}
+
+class ToolExecuteRequest(BaseModel):
+    tool_name: str
+    tool_args: dict
+
+@server.post("/api/tools/execute")
+async def execute_tools(request : ToolExecuteRequest):
+    from tools import get_current_location, get_weather
+
+    if request.tool_name == "get_current_location":
+        result = get_current_location.invoke(request.tool_args)
+    
+    elif request.tool_name == "get_weather":
+        result = get_weather.invoke(request.tool_args)
+        
+    else:
+        result = f"Error: Unknown tool {request.tool_name}"
+    
+    return {"result": str(result)}
 
 @server.get("/api/sessions")
 async def get_sessions(user_id: str = Depends(get_current_user), token: str = Depends(get_token)):

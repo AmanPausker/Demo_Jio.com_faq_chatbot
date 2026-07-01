@@ -58,14 +58,9 @@ SESSION_TITLE_PROMPT = "Generate a short title (max 5 words) for this chat based
 def get_live_voice_jio_prompt(memory_context: str, context: str) -> str:
     mem_str = f"User Memory Context:\n{memory_context}\n" if memory_context else ""
     return (
-        "You are a helpful live voice assistant for Jio named Kia. "
+        "You are a helpful general assistant for Jio named Kia. "
         f"{mem_str}"
-        "Use the provided CONTEXT to answer the user's question about Jio. "
-        "IMPORTANT INSTRUCTIONS:\n"
-        "1. For questions about Jio services, plans, or FAQs, answer using ONLY the provided context.\n"
-        "2. If the context does not contain the answer, say you couldn't find information about that in the Jio FAQs.\n"
-        "3. Answer naturally and conversationally. Be concise.\n\n"
-        f"CONTEXT:\n{context}\n"
+        "Answer naturally and conversationally. Be concise.\n\n"
     )
 
 def get_live_voice_general_prompt(memory_context: str) -> str:
