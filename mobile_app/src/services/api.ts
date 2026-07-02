@@ -3,7 +3,7 @@ import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateLocalResponse } from './localLlama';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.169.209.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.229.219.237:8000';
 
 const getHeaders = async () => {
   const { data: { session } } = await supabase.auth.getSession();
@@ -66,18 +66,99 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
     const { prompt, context } = prepResponse.data;
     
     // Step 3: Run Local Inference
-    const finalAnswer = await generateLocalResponse(prompt + "\n\nUser: " + text, (token) => {
+    const gemmaPrompt = `<start_of_turn>user\n${prompt}\n\n${text}<end_of_turn>\n<start_of_turn>model\n`;
+    let finalAnswer = await generateLocalResponse(gemmaPrompt, (token) => {
       if (onChunk) onChunk(token);
     });
     
-    // Step 4: Return 
-    // We mock the properties that the frontend expects from the old API
+    let a2ui_messages: any[] = [];
+    let surface_id = `chat_${Date.now()}`;
+
+    // Step 3.5: Intercept leaked JSON tool calls
+    const toolRegex = /\{[\s\S]*"(name|tool)"\s*:\s*"get_(weather|current_location)"[\s\S]*\}/;
+    const match = finalAnswer.match(toolRegex);
+    if (match) {
+      try {
+        console.log("RAW MATCH:", match[0]);
+        const parsed = JSON.parse(match[0]);
+        console.log("PARSED JSON:", parsed);
+        
+        const tool_name = parsed.name || parsed.tool;
+        let tool_args = parsed.parameters || parsed.arguments || parsed.param || parsed.params || parsed.args;
+        
+        if (typeof tool_args === 'string') {
+          try { tool_args = JSON.parse(tool_args); } catch(e) {}
+        }
+        
+        if (!tool_args || Object.keys(tool_args).length === 0) {
+          tool_args = { ...parsed };
+          delete tool_args.name;
+          delete tool_args.tool;
+          delete tool_args.action;
+        }
+        
+        // Normalize alias for get_weather
+        if (tool_name === 'get_weather' && !tool_args.city && tool_args.location) {
+          tool_args.city = tool_args.location;
+          delete tool_args.location;
+        }
+        
+        console.log("EXTRACTED TOOL ARGS:", tool_args);
+        
+        // Call backend to execute tool
+        const toolResponse = await axios.post(`${API_URL}/api/tools/execute`, {
+          tool_name: tool_name,
+          tool_args: tool_args
+        }, { headers: { ...headers, 'Content-Type': 'application/json' } });
+        
+        const toolOutput = toolResponse.data.result;
+        
+        if (toolOutput.includes('WeatherCard')) {
+          const weatherData = JSON.parse(toolOutput);
+          a2ui_messages = [
+            {
+              "version": "v0.9",
+              "createSurface": {"surfaceId": surface_id, "catalogId": "https://example.com/my-catalog.json"}
+            },
+            {
+              "version": "v0.9",
+              "updateComponents": {
+                "surfaceId": surface_id,
+                "components": [
+                  {"id": "root", "component": "WeatherCard", "props": weatherData.props}
+                ]
+              }
+            }
+          ];
+          finalAnswer = `Here is the weather information for ${weatherData.props.city}.`;
+        }
+      } catch (e) {
+        console.warn("Failed to parse local tool execution:", e);
+      }
+    }
+    
+    // Step 4: Sync History to Backend
+    try {
+      await axios.post(`${API_URL}/api/chat/save_history`, {
+        user_message: text,
+        ai_message: finalAnswer,
+        session_id: sessionId,
+        router: prepResponse.data.router?.toString() || "1",
+        a2ui_messages: a2ui_messages
+      }, {
+        headers: { ...headers, 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      console.warn("Failed to sync chat history to backend:", e);
+    }
+    
+    // Step 5: Return 
     return {
       text: finalAnswer,
       session_id: sessionId,
       audio_base64: null,
-      a2ui_messages: [], // Real app would extract WeatherCard JSON here
-      surface_id: `chat_${Date.now()}`
+      a2ui_messages: a2ui_messages,
+      surface_id: surface_id
     };
 
   } catch (error: any) {

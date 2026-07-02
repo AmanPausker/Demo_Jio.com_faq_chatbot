@@ -17,7 +17,8 @@ from system_instructions import (
 from logger import logger
 load_dotenv(override=True)
 from langchain_ollama import ChatOllama
-client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", temperature = 0.2 , think=False, streaming=True, num_ctx=8192)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature = 0.2 , think=False, streaming=True, num_ctx=8192)
 from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
@@ -36,7 +37,7 @@ WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 from langchain_core.tools import tool
 
 async def general_generation_node(State: GraphState):
-    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", temperature =0.7, think=False, streaming=True, num_ctx=8192)
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature =0.7, think=False, streaming=True, num_ctx=8192)
 
     tools = [get_weather, get_current_location]
     question = State.get("question", "").lower()
@@ -114,17 +115,22 @@ async def general_generation_node(State: GraphState):
         # -- Restored Leaked Tool Interceptor for cow/gemma2_tools:2b --
         import json
         import re as _re
-        json_match = _re.search(r'(\{[\s\S]*"name"\s*:\s*"get_(weather|current_location)"[\s\S]*\})', answer)
+        json_match = _re.search(r'(\{[\s\S]*"(name|tool)"\s*:\s*"get_(weather|current_location)"[\s\S]*\})', answer)
         if json_match:
             try:
                 parsed = json.loads(json_match.group(1))
-                if parsed.get("name") == "get_weather":
-                    tool_args = parsed.get("parameters", {}) or parsed.get("arguments", {})
+                tool_name = parsed.get("name") or parsed.get("tool")
+                if tool_name == "get_weather":
+                    tool_args = parsed.get("parameters") or parsed.get("arguments") or parsed.get("param") or parsed.get("params") or parsed.get("args")
+                    if not tool_args:
+                        tool_args = {k: v for k, v in parsed.items() if k not in ["name", "tool", "action"]}
+                    if "city" not in tool_args and "location" in tool_args:
+                        tool_args["city"] = tool_args.pop("location")
                     tool_output = get_weather.invoke(tool_args)
                     if "WeatherCard" in str(tool_output):
                         print("[TOOL] One-Call Exception triggered for leaked JSON get_weather. Returning raw JSON.")
                         return {"answer": str(tool_output), "messages": [response]}
-                elif parsed.get("name") == "get_current_location":
+                elif tool_name == "get_current_location":
                     location = get_current_location.invoke({})
                     tool_output = get_weather.invoke({"city": location})
                     if "WeatherCard" in str(tool_output):
@@ -151,7 +157,7 @@ async def general_generation_node(State: GraphState):
         if _re.search(combined_pattern, answer, _re.IGNORECASE):
             print(f"[WARN] Model leaked tool call as text, retrying without tools.")
             print(f"[WARN] Original answer: {answer[:200]}")
-            plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, streaming=True, num_ctx=8192)
+            plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, streaming=True, num_ctx=8192)
             raw_plain = [SystemMessage(content=system_prompt)] + State["messages"]
             plain_messages = []
             for m in raw_plain:
@@ -335,6 +341,7 @@ def fetch_user_memories(user_id: str, token: str) -> str:
         res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
         if res.data:
             facts = res.data[0].get("facts", []) or []
+            print(f"[LTM FETCH] Retrieved facts for user {user_id}: {facts}")
             if facts:
                 return "User Profile / Long-Term Memories:\n" + "\n".join(f"- {m}" for m in facts) + "\n"
     except Exception as e:
@@ -386,7 +393,8 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
     if not question:
         return
     from langchain_ollama import ChatOllama
-    client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, num_ctx=8192)
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=8192)
     
     system_prompt = MEMORY_EVALUATION_PROMPT
 
@@ -415,12 +423,15 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
             print(f"[MEMORY BACKGROUND] -> JSON Parse Error: {e} | Content: {content}")
             return
             
-        save_memory = result.get("save_memory", False)
-        memory_content = result.get("memory_content", "")
+        action = result.get("action", "NONE")
+        old_fact = result.get("old_fact", "")
+        new_fact = result.get("new_fact", "")
         
-        if save_memory and memory_content:
-            print(f"[MEMORY BACKGROUND] -> DECISION: SAVE TO LTM")
-            print(f"[MEMORY BACKGROUND] -> CONTENT: {memory_content}")
+        print(f"[MEMORY BACKGROUND] -> LLM Output: {content}")
+        
+        if action in ["ADD", "UPDATE", "DELETE"]:
+            print(f"[MEMORY BACKGROUND] -> DECISION: {action} LTM")
+            print(f"[MEMORY BACKGROUND] -> OLD FACT: {old_fact} | NEW FACT: {new_fact}")
             
             print(f"\n[MEMORY BACKGROUND] Connecting to Supabase to store memory...")
             if token:
@@ -429,20 +440,32 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
                 user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
                 
             res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+            facts = []
             if res.data:
                 facts = res.data[0].get("facts", []) or []
-                if memory_content not in facts:
-                    facts.append(memory_content)
-                    user_supabase.table("user_memory").update({"facts": facts}).eq("user_id", user_id).execute()
+                
+            if action == "ADD" and new_fact and new_fact not in facts:
+                facts.append(new_fact)
+            elif action == "UPDATE" and new_fact:
+                if old_fact in facts:
+                    facts.remove(old_fact)
+                if new_fact not in facts:
+                    facts.append(new_fact)
+            elif action == "DELETE" and old_fact in facts:
+                facts.remove(old_fact)
+                
+            if res.data:
+                user_supabase.table("user_memory").update({"facts": facts}).eq("user_id", user_id).execute()
             else:
                 user_supabase.table("user_memory").insert({
                     "user_id": user_id,
-                    "facts": [memory_content]
+                    "facts": facts
                 }).execute()
             
-            print(f"[MEMORY BACKGROUND] -> Successfully stored memory in Supabase.")
+            print(f"[MEMORY BACKGROUND] -> Successfully updated memory in Supabase. Current facts: {facts}")
+            logger.info(f"[LTM SAVED] Successfully {action} memory for user {user_id}. New fact: {new_fact} | Current facts: {facts}")
         else:
-            print("[MEMORY BACKGROUND] -> DECISION: DO NOT SAVE")
+            print("[MEMORY BACKGROUND] -> DECISION: DO NOT SAVE (NONE)")
             
     except Exception as e:
         print(f"[MEMORY BACKGROUND] -> Error: {e}")
@@ -482,7 +505,8 @@ async def summarize_short_term_memory_bg(session_id: str):
             convo_text += f"{role}: {m.content}\n"
             
         from langchain_ollama import ChatOllama
-        client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False, num_ctx=8192)
+        OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=8192)
         
         system_prompt = STM_SUMMARIZATION_PROMPT
         prompt = [
@@ -493,6 +517,7 @@ async def summarize_short_term_memory_bg(session_id: str):
         try:
             response = await client.ainvoke(prompt)
             summary = response.content.strip()
+            print(f"[STM SUMMARIZER] Generated Summary:\n{summary}")
             
             delete_msgs = [RemoveMessage(id=m.id) for m in messages_to_summarize if m.id]
             summary_msg = SystemMessage(content=f"[System Note: Summary of previous conversation]\n{summary}")

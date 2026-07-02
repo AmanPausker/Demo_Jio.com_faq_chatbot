@@ -63,7 +63,7 @@ import datetime
 
 async def save_messages_to_supabase(token: str, session_id: str, user_msg: str, ai_msg: str, a2ui_msgs: list):
     user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
-    now = datetime.utcnow().isoformat()
+    now = datetime.datetime.utcnow().isoformat()
     rows = [
         {"session_id": session_id, "role": "user", "content": user_msg, "a2ui": None, "created_at": now},
         {"session_id": session_id, "role": "ai", "content": ai_msg, "a2ui": json.dumps(a2ui_msgs) if a2ui_msgs else None, "created_at": now},
@@ -110,7 +110,8 @@ def generate_session_title_bg(session_id: str, user_id:str, token : str, user_me
         user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options =ClientOptions(headers = {"Authorization":f"Bearer {token}"}))
         from langchain_ollama import ChatOllama
         from langchain_core.messages import SystemMessage, HumanMessage
-        client = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", think=False)
+        OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False)
         title_msg = client.invoke([
             SystemMessage(content=SESSION_TITLE_PROMPT)
             , 
@@ -174,6 +175,12 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     image_base64: Optional[str] = None
 
+class ChatSaveRequest(BaseModel):
+    user_message: str
+    ai_message: str
+    session_id: str
+    router: str
+    a2ui_messages: Optional[list] = None
 
 @server.post("/api/chat")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
@@ -242,9 +249,9 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                 async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
                     langgraph_app = workflow.compile(checkpointer=memory)
                     await langgraph_app.aupdate_state(
-                        
                         config,
-                        {"messages": [HumanMessage(content=f"[Attached Image] {prompt}"), AIMessage(content=full_answer)]}
+                        {"messages": [HumanMessage(content=f"[Attached Image] {prompt}"), AIMessage(content=full_answer)]},
+                        as_node="__start__"
                     )
                     await save_messages_to_supabase(token, request.session_id, user_message, new_answer, a2ui_msgs)
             except Exception as e:
@@ -324,6 +331,34 @@ async def prepare_chat(request: ChatRequest, user_id: str = Depends(get_current_
         system_prompt = get_faq_generation_prompt(memory_context, context)
         
     return {"prompt": system_prompt, "router": router, "context": context}
+
+@server.post("/api/chat/save_history")
+async def save_chat_history(request: ChatSaveRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    config = {"configurable": {"thread_id": request.session_id}}
+    
+    # 1. Update LangGraph State
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        langgraph_app = workflow.compile(checkpointer=memory)
+        await langgraph_app.aupdate_state(
+            config,
+            {"messages": [HumanMessage(content=request.user_message), AIMessage(content=request.ai_message)]},
+            as_node="__start__"
+        )
+    
+    # 2. Save to Supabase
+    await save_messages_to_supabase(token, request.session_id, request.user_message, request.ai_message, request.a2ui_messages)
+    
+    # 3. Background Tasks (LTM and STM)
+    if str(request.router).strip() != "2":
+        from nodes import evaluate_and_save_memory_bg
+        background_tasks.add_task(evaluate_and_save_memory_bg, request.user_message, request.ai_message, user_id, token)
+        
+    from nodes import summarize_short_term_memory_bg
+    background_tasks.add_task(summarize_short_term_memory_bg, request.session_id)
+    
+    logger.info(f"[CHAT SAVE] Saved history for session={request.session_id} router={request.router}")
+    
+    return {"success": True}
 
 class ToolExecuteRequest(BaseModel):
     tool_name: str
@@ -503,7 +538,8 @@ OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 # kimi_vision_llm removed in favor of direct aiohttp call to qwen-vision
 
 # ChatGroq streams genuine tokens (sub-50ms TTFT)
-primary_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url="http://localhost:11434", streaming=True, think=False)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+primary_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, streaming=True, think=False)
 
 
 class TTSAudioTrack(MediaStreamTrack):
@@ -726,7 +762,8 @@ async def query_qwen_vision(prompt: str, base64_image: str,
     img.save(out_io, format='JPEG', quality=85)
     compressed_b64 = base64.b64encode(out_io.getvalue()).decode('utf-8')
 
-    url = "http://localhost:11434/api/chat"
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    url = f"{OLLAMA_BASE_URL}/api/chat"
     system_text = system_override or 'Output ONLY valid JSON in this exact format: {"description": "1 short sentence max 15 words"}'
     payload = {
         "model": "qwen-vision",
@@ -985,8 +1022,9 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
         tts_queue: asyncio.Queue = asyncio.Queue()
 
         async def custom_ollama_stream(msgs):
-            import json, aiohttp
-            url = "http://localhost:11434/v1/chat/completions"
+            import json, aiohttp, os
+            OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            url = f"{OLLAMA_BASE_URL}/v1/chat/completions"
             payload = {
                 "model": "cow/gemma2_tools:2b",
                 "stream": True,
