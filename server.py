@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import asyncio
 from typing import Optional
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, RemoveMessage
 from langchain_ollama import ChatOllama
 from get_audio import generate_speech
 from get_transcript import transcribe_audio_file
@@ -182,8 +182,21 @@ class ChatSaveRequest(BaseModel):
     router: str
     a2ui_messages: Optional[list] = None
 
+class MemoryApplyRequest(BaseModel):
+    action: str
+    old_fact: Optional[str] = None
+    new_fact: Optional[str] = None
+
+class SummaryApplyRequest(BaseModel):
+    session_id: str
+    summary: str
+
+class MemoryCleanRequest(BaseModel):
+    facts: list[str]
+
 @server.post("/api/chat")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    t_chat = time.time()
     thread_id = request.session_id or user_id
     config = {"configurable": {"thread_id": thread_id}}
     logger.info(f"[CHAT] user={user_id} session={thread_id} msg_len={len(request.message)}")
@@ -226,11 +239,14 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                 logger.info(f"[VISION] Received image_base64 length={len(request.image_base64)}")
                 yield f"data: {json.dumps({'type': 'token', 'payload': ''})}\n\n"
                 prompt = user_message if user_message else "What is shown in this image?"
+                t_vision_llm = time.time()
                 full_answer = await query_qwen_vision(
                     prompt, request.image_base64,
                     max_tokens=512,
                     system_override="Answer the user's question directly based on the image. Be concise."
                 )
+                vision_llm_ms = (time.time() - t_vision_llm) * 1000
+                logger.info(f"[LATENCY] /api/chat vision LLM: {vision_llm_ms:.0f}ms")
                 logger.info(f"[VISION] Qwen Vision response: {full_answer}")
                 full_answer = full_answer.strip()
 
@@ -264,6 +280,8 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
             langgraph_app = workflow.compile(checkpointer=memory)
             full_answer = ""
             router_val = "unknown"
+            t_llm_start = time.time()
+            first_token = True
             
             try:
                 async for event in langgraph_app.astream_events(initial_state, config=config, version="v2"):
@@ -271,9 +289,14 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                     if kind == "on_chat_model_stream":
                         chunk = event["data"]["chunk"]
                         if isinstance(chunk, AIMessageChunk) and chunk.content:
+                            if first_token:
+                                ttft = (time.time() - t_llm_start) * 1000
+                                logger.info(f"[LATENCY] /api/chat time_to_first_token: {ttft:.0f}ms")
+                                first_token = False
                             token_payload = json.dumps({"type": "token", "payload": chunk.content})
                             yield f"data: {token_payload}\n\n"
                             full_answer += chunk.content
+                llm_ms = (time.time() - t_llm_start) * 1000
             except Exception as e:
                 logger.error(f"[CHAT STREAM] Error: {e}")
                 
@@ -285,6 +308,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                 answer = full_answer
                 
             logger.info(f"[CHAT] Done: user={user_id} session={thread_id} router={router_val} answer_len={len(answer)}")
+            logger.info(f"[LATENCY] /api/chat LLM generation: {llm_ms:.0f}ms chars={len(answer)}")
             
             if str(router_val).strip() != "2":
                 from nodes import evaluate_and_save_memory_bg
@@ -304,12 +328,14 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
                 "session_id": thread_id
             })
             yield f"data: {final_payload}\n\n"
+        logger.info(f"[LATENCY] /api/chat: total={time.time() - t_chat:.2f}s router={router_val} ans_len={len(answer)}")
 
     from fastapi.responses import StreamingResponse
     return StreamingResponse(event_generator(), media_type="text/event-stream", background=background_tasks)
 
 @server.post("/api/chat/prepare")
 async def prepare_chat(request: ChatRequest, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    t_prepare = time.time()
     state = {"question": request.message}
     config = {"configurable": {"thread_id": request.session_id or user_id}}
     
@@ -317,25 +343,47 @@ async def prepare_chat(request: ChatRequest, user_id: str = Depends(get_current_
     from system_instructions import get_general_generation_prompt, get_faq_generation_prompt
     
     # retrieve_node returns a Python dictionary, not an object
+    t_rag = time.time()
     router_response = retrieve_node(state, config)
+    rag_ms = (time.time() - t_rag) * 1000
     context = router_response.get("context", "")
     router = router_response.get("router", 1)
     
     #fetch the user memories!
+    t_mem = time.time()
     memory_context = fetch_user_memories(user_id, token)
+    mem_ms = (time.time() - t_mem) * 1000
 
     if router == 1:
         # You need to assign the result of the function to the 'system_prompt' variable
         system_prompt = get_general_generation_prompt(memory_context)
     else:
         system_prompt = get_faq_generation_prompt(memory_context, context)
-        
+    
+    total_ms = (time.time() - t_prepare) * 1000
+    logger.info(f"[LATENCY] /api/chat/prepare: rag={rag_ms:.0f}ms mem={mem_ms:.0f}ms router={router} total={total_ms:.0f}ms (NOTE: LLM inference NOT included - runs client-side)")
+    
     return {"prompt": system_prompt, "router": router, "context": context}
 
 @server.post("/api/chat/save_history")
 async def save_chat_history(request: ChatSaveRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
     config = {"configurable": {"thread_id": request.session_id}}
     
+    # 0. Auto-create session if it doesn't exist
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    if request.session_id:
+        session_res = user_supabase.table("chat_sessions").select("*").eq("id", request.session_id).execute()
+        if not session_res.data:
+            try:
+                user_supabase.table("chat_sessions").insert({
+                    "id": request.session_id,
+                    "user_id": user_id,
+                    "title": "New Chat"
+                }).execute()
+                background_tasks.add_task(generate_session_title_bg, request.session_id, user_id, token, request.user_message)
+            except Exception as e:
+                logger.debug(f"Failed to create session in save_history: {e}")
+
     # 1. Update LangGraph State
     async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
         langgraph_app = workflow.compile(checkpointer=memory)
@@ -348,16 +396,77 @@ async def save_chat_history(request: ChatSaveRequest, background_tasks: Backgrou
     # 2. Save to Supabase
     await save_messages_to_supabase(token, request.session_id, request.user_message, request.ai_message, request.a2ui_messages)
     
-    # 3. Background Tasks (LTM and STM)
-    if str(request.router).strip() != "2":
-        from nodes import evaluate_and_save_memory_bg
-        background_tasks.add_task(evaluate_and_save_memory_bg, request.user_message, request.ai_message, user_id, token)
-        
-    from nodes import summarize_short_term_memory_bg
-    background_tasks.add_task(summarize_short_term_memory_bg, request.session_id)
-    
     logger.info(f"[CHAT SAVE] Saved history for session={request.session_id} router={request.router}")
     
+    return {"success": True}
+
+@server.post("/api/memory/apply")
+async def apply_memory(request: MemoryApplyRequest, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+    facts = []
+    if res.data:
+        facts = res.data[0].get("facts", []) or []
+        
+    action = request.action.upper()
+    new_fact = request.new_fact
+    old_fact = request.old_fact
+
+    if action == "ADD" and new_fact and new_fact not in facts:
+        facts.append(new_fact)
+    elif action == "UPDATE" and new_fact:
+        if old_fact in facts:
+            facts.remove(old_fact)
+        if new_fact not in facts:
+            facts.append(new_fact)
+    elif action == "DELETE" and old_fact in facts:
+        facts.remove(old_fact)
+        
+    if res.data:
+        user_supabase.table("user_memory").update({"facts": facts}).eq("user_id", user_id).execute()
+    else:
+        user_supabase.table("user_memory").insert({"user_id": user_id, "facts": facts}).execute()
+    
+    logger.info(f"[MOBILE LTM SAVED] Successfully {action} memory for user {user_id}. New fact: {new_fact} | Current facts: {facts}")
+    return {"success": True, "facts": facts}
+
+@server.post("/api/memory/clean")
+async def clean_memory(request: MemoryCleanRequest, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY, options=ClientOptions(headers={"Authorization": f"Bearer {token}"}))
+    res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
+    facts = res.data[0].get("facts", []) if res.data else []
+    cleaned = [f for f in facts if f not in request.facts]
+    removed = len(facts) - len(cleaned)
+    if res.data:
+        user_supabase.table("user_memory").update({"facts": cleaned}).eq("user_id", user_id).execute()
+    else:
+        user_supabase.table("user_memory").insert({"user_id": user_id, "facts": cleaned}).execute()
+    logger.info(f"[MEMORY CLEAN] user={user_id} removed={removed} remaining={len(cleaned)}")
+    return {"success": True, "removed": removed, "facts": cleaned}
+
+@server.post("/api/chat/apply_summary")
+async def apply_summary(request: SummaryApplyRequest, user_id: str = Depends(get_current_user)):
+    config = {"configurable": {"thread_id": request.session_id}}
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        langgraph_app = workflow.compile(checkpointer=memory)
+        state = await langgraph_app.aget_state(config)
+        
+        if not state or not hasattr(state, "values") or "messages" not in state.values:
+            return {"success": False, "message": "No state found"}
+            
+        messages = state.values["messages"]
+        if len(messages) <= 5:
+            return {"success": False, "message": "Not enough messages"}
+            
+        messages_to_summarize = messages[:-2]
+        summary_message = SystemMessage(content=f"Summary of conversation earlier: {request.summary}")
+        
+        delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
+        
+        await langgraph_app.aupdate_state(config, {"messages": delete_messages}, as_node="__start__")
+        await langgraph_app.aupdate_state(config, {"messages": [summary_message]}, as_node="__start__")
+        
+    logger.info(f"[MOBILE STM SAVED] Updated summary for session={request.session_id}")
     return {"success": True}
 
 class ToolExecuteRequest(BaseModel):
@@ -922,6 +1031,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     
     # 1. Fetch Retrieval Context from Neo4j/Qdrant
     retrieved_context = ""
+    t_live_rag = time.time()
     
     # Only fetch retrieval context if we are in live-audio-chat (no video frames)
     if not session.frame_buffer:
@@ -937,14 +1047,17 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
             }
             retrieval_result = await asyncio.to_thread(retrieve_node, retrieve_state, config)
             retrieved_context = retrieval_result.get("context", "")
+            live_logger.info(f"[LATENCY] live RAG retrieval: {(time.time() - t_live_rag)*1000:.0f}ms")
         except Exception as e:
             live_logger.error(f"[RETRIEVAL ERROR] {e}")
 
     memory_context = ""
     from nodes import fetch_user_memories
+    t_live_mem = time.time()
     try:
         if getattr(session, "token", None):
             memory_context = await asyncio.to_thread(fetch_user_memories, session.user_id, session.token)
+            live_logger.info(f"[LATENCY] live memory fetch: {(time.time() - t_live_mem)*1000:.0f}ms")
     except Exception as e:
         logger.debug(f"Live memory fetch error: {e}")
 

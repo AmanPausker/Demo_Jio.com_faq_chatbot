@@ -6,6 +6,7 @@ const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000';
 
 export const getLlamaContext = async (): Promise<LlamaContext> => {
     if (llamaContext) return llamaContext;
+    console.log("[LATENCY] Starting model initialization...");
 
     // Assuming the GGUF model is downloaded to the app's document directory.
     // In a real app, you'd add a download screen before reaching this point.
@@ -43,12 +44,13 @@ export const getLlamaContext = async (): Promise<LlamaContext> => {
         const osPath = modelPath.startsWith('file://') ? modelPath.replace('file://', '') : modelPath;
         llamaContext = await initLlama({
             model: osPath,
-            use_mlock: true, // Lock model in RAM
-            n_ctx: 2048,     // Context window
-            n_gpu_layers: 0, // Set >0 if metal/gpu is enabled
+            use_mlock: false,
+            n_ctx: 2048,
+            n_gpu_layers: 0,
+            n_threads: 8,     // Use all 8 cores on Moto G85 (Snapdragon 6s Gen 3)
         });
 
-        console.log("Local LLM initialized successfully!");
+        console.log(`[LATENCY] Model initialized successfully`);
         return llamaContext;
     } catch (error) {
         console.error("Failed to initialize LlamaContext", error);
@@ -60,9 +62,11 @@ export const generateLocalResponse = async (
     prompt: string,
     onChunk: (text: string) => void
 ): Promise<string> => {
+    const tInf = Date.now();
     const context = await getLlamaContext();
 
     let fullResponse = "";
+    let firstToken = true;
 
     return new Promise((resolve, reject) => {
         context.completion(
@@ -70,16 +74,23 @@ export const generateLocalResponse = async (
                 prompt,
                 n_predict: 512,
                 temperature: 0.7,
+                n_threads: 8,
             },
             (res) => {
                 // Stream the token to the UI
                 if (res.token) {
+                    if (firstToken) {
+                        console.log(`[LATENCY] Local LLM first token: ${Date.now() - tInf}ms`);
+                        firstToken = false;
+                    }
                     fullResponse += res.token;
                     onChunk(res.token);
                 }
             }
         )
             .then(() => {
+                console.log(`[LATENCY] Local LLM inference: ${Date.now() - tInf}ms chars=${fullResponse.length}`);
+
                 // Basic Tool Interception Logic
                 // Check if the LLM outputted a JSON tool call instead of normal text
                 const toolMatch = fullResponse.match(/\{[\s\S]*"name"\s*:\s*"get_(weather|current_location)"[\s\S]*\}/);

@@ -15,6 +15,7 @@ from system_instructions import (
     STM_SUMMARIZATION_PROMPT
 )
 from logger import logger
+import time as _time
 load_dotenv(override=True)
 from langchain_ollama import ChatOllama
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -37,6 +38,7 @@ WORKERS_API_KEY = os.getenv("WORKERS_API_KEY")
 from langchain_core.tools import tool
 
 async def general_generation_node(State: GraphState):
+    t_node = _time.time()
     client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature =0.7, think=False, streaming=True, num_ctx=8192)
 
     tools = [get_weather, get_current_location]
@@ -49,7 +51,9 @@ async def general_generation_node(State: GraphState):
         llm_with_tools = client
     user_id = State.get("user_id", "")
     token = State.get("token", "")
+    t_mem = _time.time()
     memory_context = fetch_user_memories(user_id, token)
+    logger.info(f"[LATENCY] fetch_user_memories: {(_time.time() - t_mem)*1000:.0f}ms")
 
     system_prompt = get_general_generation_prompt(memory_context)
     raw_messages = [SystemMessage(content=system_prompt)] + State["messages"]
@@ -62,12 +66,14 @@ async def general_generation_node(State: GraphState):
             messages.append(m)
     
     try:
+        t_llm = _time.time()
         response = None
         async for chunk in llm_with_tools.astream(messages):
             if response is None:
                 response = chunk
             else:
                 response += chunk
+        llm_ms = (_time.time() - t_llm) * 1000
 
         max_tool_rounds = 5
         tool_round = 0
@@ -110,6 +116,7 @@ async def general_generation_node(State: GraphState):
             print(f"[WARN] Tool call loop hit max {max_tool_rounds} rounds, breaking out")
         
         answer = response.content
+        logger.info(f"[LATENCY] general_generation_node: total={(_time.time() - t_node)*1000:.0f}ms llm={llm_ms:.0f}ms tools={tool_round} ans_len={len(answer)}")
         
 
         # -- Restored Leaked Tool Interceptor for cow/gemma2_tools:2b --
@@ -157,6 +164,7 @@ async def general_generation_node(State: GraphState):
         if _re.search(combined_pattern, answer, _re.IGNORECASE):
             print(f"[WARN] Model leaked tool call as text, retrying without tools.")
             print(f"[WARN] Original answer: {answer[:200]}")
+            t_retry = _time.time()
             plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, streaming=True, num_ctx=8192)
             raw_plain = [SystemMessage(content=system_prompt)] + State["messages"]
             plain_messages = []
@@ -172,6 +180,7 @@ async def general_generation_node(State: GraphState):
                 else:
                     response += chunk
             answer = response.content
+            logger.info(f"[LATENCY] general_generation_node retry: {(_time.time() - t_retry)*1000:.0f}ms")
             
         return {"answer": answer, "messages":[response]}
     except Exception as e:
@@ -185,6 +194,7 @@ async def general_generation_node(State: GraphState):
 from langchain_core.runnables import RunnableConfig
 
 def retrieve_node(state:GraphState, config: RunnableConfig):
+    t_retrieve = _time.time()
     print("Retreiving from neo4j")
     question = state['question']
     
@@ -244,8 +254,10 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     question = re.sub(r'\b[A-Za-z]+\b', fuzzy_replace, question)
     state['question'] = question
     
+    t_embed = _time.time()
     # 1. Vector Search uses the corrected question
     question_vector = model.encode(question).tolist()
+    logger.info(f"[LATENCY] encode_question: {(_time.time() - t_embed)*1000:.0f}ms")
 
     # 2. Extract Keywords locally
     words = re.findall(r'\b\w+\b', question)
@@ -276,26 +288,33 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     RETURN "Topic: " + t.name + " | Subtopic: " + s.name + " | Question: " + f.question + " | Answer: " + f.answer AS context_string
     """
     
+    t_db = _time.time()
     candidates = []
     with driver.session() as session:
         result = session.run(cypher_query, question_embedding=question_vector, keyword_query=keyword_query)
         for record in result:
             candidates.append(record['context_string'])
+    db_ms = (_time.time() - t_db) * 1000
     
+    t_qdrant = _time.time()
     user_id = state.get("user_id", "")
     session_id = config.get("configurable", {}).get("thread_id", "")
     qdrant_results = search_qdrant(question_vector, user_id=user_id, session_id=session_id)
+    qdrant_ms = (_time.time() - t_qdrant) * 1000
     for chunk in qdrant_results:
         # We wrap it in a string so the LLM knows where it came from
         candidates.append(f"Uploaded Document Context: {chunk}")
         
     if not candidates:
+        logger.info(f"[LATENCY] retrieve_node: db={db_ms:.0f}ms qdrant={qdrant_ms:.0f}ms candidates=0 total={(_time.time() - t_retrieve)*1000:.0f}ms")
         print("Semantic Router: No candidates found. Routing to General Agent.")
         return {"context": "", "router": 1}
 
     # 4. Rerank candidates using CrossEncoder
+    t_rerank = _time.time()
     cross_inp = [[state["question"], context] for context in candidates]
     scores = reranker.predict(cross_inp)
+    rerank_ms = (_time.time() - t_rerank) * 1000
 
     # Combine candidates with scores, apply a massive boost to uploaded documents, and sort
     scored_candidates = []
@@ -324,12 +343,15 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     top_candidates = [candidate for candidate, score in scored_candidates[:1]]
     
     retrieved_context = "\n".join(top_candidates) + "\n"
+    total_ms = (_time.time() - t_retrieve) * 1000
+    logger.info(f"[LATENCY] retrieve_node: db={db_ms:.0f}ms qdrant={qdrant_ms:.0f}ms rerank={rerank_ms:.0f}ms candidates={len(candidates)} best_score={best_score:.2f} total={total_ms:.0f}ms")
     return {"context": retrieved_context, "router": 2}
 
 def fetch_user_memories(user_id: str, token: str) -> str:
     if not user_id:
         return ""
     try:
+        t_start = _time.time()
         from supabase import create_client, ClientOptions
         SUPABASE_URL = os.getenv("VITE_SUPABASE_URL")
         SUPABASE_ANON_KEY = os.getenv("VITE_SUPABASE_ANON_KEY")
@@ -341,6 +363,7 @@ def fetch_user_memories(user_id: str, token: str) -> str:
         res = user_supabase.table("user_memory").select("facts").eq("user_id", user_id).execute()
         if res.data:
             facts = res.data[0].get("facts", []) or []
+            logger.info(f"[LATENCY] fetch_user_memories: {(_time.time() - t_start)*1000:.0f}ms facts={len(facts)}")
             print(f"[LTM FETCH] Retrieved facts for user {user_id}: {facts}")
             if facts:
                 return "User Profile / Long-Term Memories:\n" + "\n".join(f"- {m}" for m in facts) + "\n"
@@ -349,11 +372,14 @@ def fetch_user_memories(user_id: str, token: str) -> str:
     return ""
 
 async def generate_node(state:GraphState):
+    t_node = _time.time()
     question = state["question"]
     context = state["context"]
     user_id = state.get("user_id", "")
     token = state.get("token", "")
+    t_mem = _time.time()
     memory_context = fetch_user_memories(user_id, token)
+    logger.info(f"[LATENCY] fetch_user_memories: {(_time.time() - t_mem)*1000:.0f}ms")
 
     system_prompt = get_faq_generation_prompt(memory_context, context)
 
@@ -366,12 +392,15 @@ async def generate_node(state:GraphState):
             messages.append(m)
     
     try:
+        t_llm = _time.time()
         response = None
         async for chunk in client.astream(messages):
             if response is None:
                 response = chunk
             else:
                 response += chunk
+        llm_ms = (_time.time() - t_llm) * 1000
+        logger.info(f"[LATENCY] generate_node: llm={llm_ms:.0f}ms total={(_time.time() - t_node)*1000:.0f}ms ans_len={len(response.content)}")
         return {"answer": response.content, "messages":[response]}
     except Exception as e:
         print(f"NVIDIA API Error: {e}")
@@ -388,6 +417,7 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
     """
     Evaluates the conversation in the background and saves to Supabase if necessary.
     """
+    t_start = _time.time()
     print("\n[MEMORY BACKGROUND] Evaluating conversation for long-term memory...")
     
     if not question:
@@ -467,6 +497,8 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
         else:
             print("[MEMORY BACKGROUND] -> DECISION: DO NOT SAVE (NONE)")
             
+        logger.info(f"[LATENCY] evaluate_and_save_memory_bg: {(_time.time() - t_start)*1000:.0f}ms action={action}")
+            
     except Exception as e:
         print(f"[MEMORY BACKGROUND] -> Error: {e}")
         logger.error(f"[MEMORY BACKGROUND] Error: {e}")
@@ -476,6 +508,7 @@ async def summarize_short_term_memory_bg(session_id: str):
     Background task to summarize short term memory (LangGraph state) 
     if it exceeds 5 messages, to prevent context bloat.
     """
+    t_start = _time.time()
     from app import workflow
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     from langchain_core.messages import RemoveMessage, SystemMessage
@@ -524,6 +557,7 @@ async def summarize_short_term_memory_bg(session_id: str):
             
             await langgraph_app.aupdate_state(config, {"messages": delete_msgs + [summary_msg]})
             print(f"[STM SUMMARIZER] Successfully summarized and pruned {len(messages_to_summarize)} messages.")
+            logger.info(f"[LATENCY] summarize_short_term_memory_bg: {(_time.time() - t_start)*1000:.0f}ms")
             
         except Exception as e:
             print(f"[STM SUMMARIZER] Error summarizing: {e}")

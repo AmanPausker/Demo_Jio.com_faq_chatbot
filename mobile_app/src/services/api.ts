@@ -3,10 +3,62 @@ import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateLocalResponse } from './localLlama';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.229.219.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.144.199.237:8000';
+import { MEMORY_EVALUATION_PROMPT, STM_SUMMARIZATION_PROMPT } from './prompts';
+
+const runBackgroundTasks = async (userMessage: string, aiMessage: string, sessionId: string, router: string, headers: any) => {
+  const tBgStart = Date.now();
+  try {
+    if (router !== "2") {
+      const tLtm = Date.now();
+      console.log("Running background LTM evaluation on mobile...");
+      const ltmPrompt = `<start_of_turn>user\n${MEMORY_EVALUATION_PROMPT}\n\nConversation:\nUser: ${userMessage}\nAI: ${aiMessage}<end_of_turn>\n<start_of_turn>model\n`;
+      const ltmResult = await generateLocalResponse(ltmPrompt, () => {});
+      console.log(`[LATENCY] Mobile LTM eval: ${Date.now() - tLtm}ms`);
+      try {
+        const jsonMatch = ltmResult.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const ltmJson = JSON.parse(jsonMatch[0]);
+          if (ltmJson.action && ltmJson.action !== "NONE") {
+            const tLtmApi = Date.now();
+            await axios.post(`${API_URL}/api/memory/apply`, ltmJson, { headers: { ...headers, 'Content-Type': 'application/json' } });
+            console.log(`[LATENCY] Mobile LTM POST /api/memory/apply: ${Date.now() - tLtmApi}ms`);
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to parse LTM JSON", e);
+      }
+    }
+    console.log("Checking history for STM summarization...");
+    const tStm = Date.now();
+    const history = await loadSessionHistory(sessionId);
+    if (history.length > 5) {
+      console.log(`History has ${history.length} messages. Running STM summarization...`);
+      const msgsToSummarize = history.slice(0, history.length - 2);
+      let convoText = "";
+      msgsToSummarize.forEach((msg: any) => {
+        const role = msg.type === "human" || msg.type === "user" ? "User" : "AI";
+        convoText += `${role}: ${msg.content}\n`;
+      });
+      const stmPrompt = `<start_of_turn>user\n${STM_SUMMARIZATION_PROMPT}\n\nConversation:\n${convoText}<end_of_turn>\n<start_of_turn>model\n`;
+      const stmGenStart = Date.now();
+      const stmResult = await generateLocalResponse(stmPrompt, () => {});
+      console.log(`[LATENCY] Mobile STM generation: ${Date.now() - stmGenStart}ms`);
+      const tStmApi = Date.now();
+      await axios.post(`${API_URL}/api/chat/apply_summary`, { session_id: sessionId, summary: stmResult.trim() }, { headers: { ...headers, 'Content-Type': 'application/json' } });
+      console.log(`[LATENCY] Mobile STM POST /api/chat/apply_summary: ${Date.now() - tStmApi}ms`);
+    }
+    console.log(`[LATENCY] Mobile background tasks total: ${Date.now() - tBgStart}ms`);
+  } catch (error) {
+    console.error("Background tasks failed:", error);
+  }
+};
 
 const getHeaders = async () => {
+  const tH = Date.now();
   const { data: { session } } = await supabase.auth.getSession();
+  const elapsed = Date.now() - tH;
+  if (elapsed > 100) console.warn(`[LATENCY] getHeaders (Supabase getSession): ${elapsed}ms`);
   return {
     'Content-Type': 'application/json',
     'Authorization': session ? `Bearer ${session.access_token}` : '',
@@ -30,10 +82,12 @@ export const fetchSessions = async () => {
 };
 
 export const loadSessionHistory = async (sessionId: string) => {
+  const tLoad = Date.now();
   try {
     const headers = await getHeaders();
     if (!headers['Authorization']) return [];
     const response = await axios.get(`${API_URL}/api/sessions/${sessionId}/history`, { headers });
+    console.log(`[LATENCY] Mobile loadSessionHistory: ${Date.now() - tLoad}ms`);
     return response.data.history || [];
   } catch (error: any) {
     if (error.response?.status === 401) {
@@ -48,10 +102,12 @@ export const loadSessionHistory = async (sessionId: string) => {
 import EventSource from 'react-native-sse';
 
 export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void, imageBase64?: string) => {
+  const tTotal = Date.now();
   try {
     const headers = await getHeaders();
     
     // Step 1: Hit the Prep Endpoint
+    const tPrep = Date.now();
     const prepResponse = await axios.post(`${API_URL}/api/chat/prepare`, {
       message: text,
       session_id: sessionId,
@@ -61,15 +117,18 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
         'Content-Type': 'application/json',
       }
     });
+    console.log(`[LATENCY] Mobile POST /api/chat/prepare: ${Date.now() - tPrep}ms`);
     
     // Step 2: Get the Prompt
     const { prompt, context } = prepResponse.data;
     
     // Step 3: Run Local Inference
+    const tLocal = Date.now();
     const gemmaPrompt = `<start_of_turn>user\n${prompt}\n\n${text}<end_of_turn>\n<start_of_turn>model\n`;
     let finalAnswer = await generateLocalResponse(gemmaPrompt, (token) => {
       if (onChunk) onChunk(token);
     });
+    console.log(`[LATENCY] Mobile local LLM inference: ${Date.now() - tLocal}ms`);
     
     let a2ui_messages: any[] = [];
     let surface_id = `chat_${Date.now()}`;
@@ -106,10 +165,12 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
         console.log("EXTRACTED TOOL ARGS:", tool_args);
         
         // Call backend to execute tool
+        const tTool = Date.now();
         const toolResponse = await axios.post(`${API_URL}/api/tools/execute`, {
           tool_name: tool_name,
           tool_args: tool_args
         }, { headers: { ...headers, 'Content-Type': 'application/json' } });
+        console.log(`[LATENCY] Mobile tool execution: ${Date.now() - tTool}ms`);
         
         const toolOutput = toolResponse.data.result;
         
@@ -138,6 +199,7 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
     }
     
     // Step 4: Sync History to Backend
+    const tSync = Date.now();
     try {
       await axios.post(`${API_URL}/api/chat/save_history`, {
         user_message: text,
@@ -151,8 +213,15 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
     } catch (e) {
       console.warn("Failed to sync chat history to backend:", e);
     }
+    console.log(`[LATENCY] Mobile POST /api/chat/save_history: ${Date.now() - tSync}ms`);
+    
+    // Step 4.5: Run Background Tasks (fire and forget)
+    if (sessionId) {
+      runBackgroundTasks(text, finalAnswer, sessionId, prepResponse.data.router?.toString() || "1", headers);
+    }
     
     // Step 5: Return 
+    console.log(`[LATENCY] Mobile sendChatMessage total: ${Date.now() - tTotal}ms router=${prepResponse.data.router}`);
     return {
       text: finalAnswer,
       session_id: sessionId,
@@ -173,6 +242,7 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
 };
 
 export const sendAudioMessage = async (audioUri: string, sessionId: string | null) => {
+  const tAudio = Date.now();
   try {
     const headers = await getHeaders();
 
@@ -204,7 +274,9 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
       throw new Error(`HTTP error! status: ${uploadTask.status}`);
     }
 
-    return JSON.parse(uploadTask.body);
+    const result = JSON.parse(uploadTask.body);
+    console.log(`[LATENCY] Mobile sendAudioMessage: ${Date.now() - tAudio}ms`);
+    return result;
   } catch (error) {
     console.error('Failed to send audio:', error);
     throw error;
