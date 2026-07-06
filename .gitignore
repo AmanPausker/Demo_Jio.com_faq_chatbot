@@ -1,1 +1,19 @@
 .env
+
+# Large model files
+*.gguf
+
+# Database / checkpoints
+*.db
+
+# Audio / generated media
+*.mp3
+*.wav
+
+# Node modules
+node_modules/
+mobile_app/node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
