@@ -1,3 +1,3 @@
-export const API_IP = import.meta.env.VITE_API_IP || '10.144.199.237';
+export const API_IP = import.meta.env.VITE_API_IP || '10.25.185.237';
 export const API_BASE_URL = `http://${API_IP}:8000`;
 export const WS_BASE_URL = `ws://${API_IP}:8000`;

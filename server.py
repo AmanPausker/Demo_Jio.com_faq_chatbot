@@ -111,7 +111,7 @@ def generate_session_title_bg(session_id: str, user_id:str, token : str, user_me
         from langchain_ollama import ChatOllama
         from langchain_core.messages import SystemMessage, HumanMessage
         OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False)
+        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=2048, keep_alive=-1)
         title_msg = client.invoke([
             SystemMessage(content=SESSION_TITLE_PROMPT)
             , 
@@ -312,10 +312,10 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks, user_id:
             
             if str(router_val).strip() != "2":
                 from nodes import evaluate_and_save_memory_bg
-                background_tasks.add_task(evaluate_and_save_memory_bg, user_message, answer, user_id, token)
+                asyncio.create_task(evaluate_and_save_memory_bg(user_message, answer, user_id, token))
                 
             from nodes import summarize_short_term_memory_bg
-            background_tasks.add_task(summarize_short_term_memory_bg, thread_id)
+            asyncio.create_task(summarize_short_term_memory_bg(thread_id))
             
             new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
             await save_messages_to_supabase(token, request.session_id, user_message, new_answer, a2ui_msgs)
@@ -591,10 +591,10 @@ async def chat_audio(background_tasks: BackgroundTasks, audio: UploadFile = File
     
     if str(router).strip() != "2":
         from nodes import evaluate_and_save_memory_bg
-        background_tasks.add_task(evaluate_and_save_memory_bg, user_message, answer, user_id, token)
+        asyncio.create_task(evaluate_and_save_memory_bg(user_message, answer, user_id, token))
         
     from nodes import summarize_short_term_memory_bg
-    background_tasks.add_task(summarize_short_term_memory_bg, thread_id)
+    asyncio.create_task(summarize_short_term_memory_bg(thread_id))
         
     new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(answer)
     await save_messages_to_supabase(token, session_id, user_message, new_answer, a2ui_msgs)
@@ -648,7 +648,7 @@ OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 
 # ChatGroq streams genuine tokens (sub-50ms TTFT)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-primary_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, streaming=True, think=False)
+primary_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, streaming=True, think=False, num_ctx=2048, keep_alive=-1)
 
 
 class TTSAudioTrack(MediaStreamTrack):
@@ -675,6 +675,11 @@ class TTSAudioTrack(MediaStreamTrack):
                     await self._queue.put(arr.tobytes())
         except Exception as e:
             logger.error(f"Failed to decode TTS audio for WebRTC: {e}")
+
+    async def add_silence(self, duration: float = 0.5):
+        samples = int(16000 * duration)
+        pcm = b'\x00' * (samples * 2)
+        await self._queue.put(pcm)
 
     def clear_queue(self):
         while not self._queue.empty():
@@ -853,6 +858,12 @@ def scene_changed(frame_b64: str, last_hashes: tuple,
         return False, new_hashes
     changes = sum(1 for a, b in zip(new_hashes, last_hashes) if a != b)
     return changes >= 2, new_hashes
+
+async def analyze_scene_background(session):
+    """
+    Background vision analysis stub to prevent NameError.
+    """
+    pass
 
 
 async def query_qwen_vision(prompt: str, base64_image: str,
@@ -1233,6 +1244,8 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
                         if first_chunk:
                             logger.debug(f"[LATENCY] TTS first chunk: {(time.time() - t_tts)*1000:.0f}ms")
                             first_chunk = False
+                            if hasattr(session, "tts_track") and session.tts_track:
+                                await session.tts_track.add_silence(0.8)
                         if hasattr(session, "tts_track") and session.tts_track:
                             import base64
                             wav_bytes = base64.b64decode(audio_b64)

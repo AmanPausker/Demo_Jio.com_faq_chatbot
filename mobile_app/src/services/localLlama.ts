@@ -44,10 +44,10 @@ export const getLlamaContext = async (): Promise<LlamaContext> => {
         const osPath = modelPath.startsWith('file://') ? modelPath.replace('file://', '') : modelPath;
         llamaContext = await initLlama({
             model: osPath,
-            use_mlock: false,
-            n_ctx: 2048,
+            use_mlock: true,  
+            n_ctx: 1024,      
             n_gpu_layers: 0,
-            n_threads: 8,     // Use all 8 cores on Moto G85 (Snapdragon 6s Gen 3)
+            n_threads: 8,     // Reverted to 8 as 4 was slower on Moto G85
         });
 
         console.log(`[LATENCY] Model initialized successfully`);
@@ -62,8 +62,8 @@ export const generateLocalResponse = async (
     prompt: string,
     onChunk: (text: string) => void
 ): Promise<string> => {
-    const tInf = Date.now();
     const context = await getLlamaContext();
+    const tInf = Date.now(); // Start timer AFTER the 1.6GB model is loaded into RAM
 
     let fullResponse = "";
     let firstToken = true;
@@ -72,9 +72,9 @@ export const generateLocalResponse = async (
         context.completion(
             {
                 prompt,
-                n_predict: 512,
+                n_predict: 256,   
                 temperature: 0.7,
-                n_threads: 8,
+                n_threads: 8,     
             },
             (res) => {
                 // Stream the token to the UI

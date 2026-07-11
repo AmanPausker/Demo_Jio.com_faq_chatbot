@@ -3,52 +3,16 @@ import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateLocalResponse } from './localLlama';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.144.199.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://192.168.1.2:8000';
 import { MEMORY_EVALUATION_PROMPT, STM_SUMMARIZATION_PROMPT } from './prompts';
 
 const runBackgroundTasks = async (userMessage: string, aiMessage: string, sessionId: string, router: string, headers: any) => {
   const tBgStart = Date.now();
   try {
-    if (router !== "2") {
-      const tLtm = Date.now();
-      console.log("Running background LTM evaluation on mobile...");
-      const ltmPrompt = `<start_of_turn>user\n${MEMORY_EVALUATION_PROMPT}\n\nConversation:\nUser: ${userMessage}\nAI: ${aiMessage}<end_of_turn>\n<start_of_turn>model\n`;
-      const ltmResult = await generateLocalResponse(ltmPrompt, () => {});
-      console.log(`[LATENCY] Mobile LTM eval: ${Date.now() - tLtm}ms`);
-      try {
-        const jsonMatch = ltmResult.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const ltmJson = JSON.parse(jsonMatch[0]);
-          if (ltmJson.action && ltmJson.action !== "NONE") {
-            const tLtmApi = Date.now();
-            await axios.post(`${API_URL}/api/memory/apply`, ltmJson, { headers: { ...headers, 'Content-Type': 'application/json' } });
-            console.log(`[LATENCY] Mobile LTM POST /api/memory/apply: ${Date.now() - tLtmApi}ms`);
-          }
-        }
-      } catch (e) {
-        console.warn("Failed to parse LTM JSON", e);
-      }
-    }
-    console.log("Checking history for STM summarization...");
-    const tStm = Date.now();
-    const history = await loadSessionHistory(sessionId);
-    if (history.length > 5) {
-      console.log(`History has ${history.length} messages. Running STM summarization...`);
-      const msgsToSummarize = history.slice(0, history.length - 2);
-      let convoText = "";
-      msgsToSummarize.forEach((msg: any) => {
-        const role = msg.type === "human" || msg.type === "user" ? "User" : "AI";
-        convoText += `${role}: ${msg.content}\n`;
-      });
-      const stmPrompt = `<start_of_turn>user\n${STM_SUMMARIZATION_PROMPT}\n\nConversation:\n${convoText}<end_of_turn>\n<start_of_turn>model\n`;
-      const stmGenStart = Date.now();
-      const stmResult = await generateLocalResponse(stmPrompt, () => {});
-      console.log(`[LATENCY] Mobile STM generation: ${Date.now() - stmGenStart}ms`);
-      const tStmApi = Date.now();
-      await axios.post(`${API_URL}/api/chat/apply_summary`, { session_id: sessionId, summary: stmResult.trim() }, { headers: { ...headers, 'Content-Type': 'application/json' } });
-      console.log(`[LATENCY] Mobile STM POST /api/chat/apply_summary: ${Date.now() - tStmApi}ms`);
-    }
-    console.log(`[LATENCY] Mobile background tasks total: ${Date.now() - tBgStart}ms`);
+    // Background evaluation and summarization are already triggered automatically 
+    // by the backend server when it receives the /api/chat/save_history POST request.
+    // Running these on the mobile CPU via generateLocalResponse is redundant and causes severe lag.
+    console.log("Skipping mobile background tasks (handled by backend server via save_history).");
   } catch (error) {
     console.error("Background tasks failed:", error);
   }

@@ -19,7 +19,7 @@ import time as _time
 load_dotenv(override=True)
 from langchain_ollama import ChatOllama
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature = 0.2 , think=False, streaming=True, num_ctx=8192)
+client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature = 0.2 , think=False, streaming=True, num_ctx=2048, keep_alive=-1)
 from tools import get_weather, get_current_location
 
 URL = "bolt://localhost:7687"
@@ -39,7 +39,7 @@ from langchain_core.tools import tool
 
 async def general_generation_node(State: GraphState):
     t_node = _time.time()
-    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature =0.7, think=False, streaming=True, num_ctx=8192)
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, temperature =0.7, think=False, streaming=True, num_ctx=2048, keep_alive=-1)
 
     tools = [get_weather, get_current_location]
     question = State.get("question", "").lower()
@@ -165,7 +165,7 @@ async def general_generation_node(State: GraphState):
             print(f"[WARN] Model leaked tool call as text, retrying without tools.")
             print(f"[WARN] Original answer: {answer[:200]}")
             t_retry = _time.time()
-            plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, streaming=True, num_ctx=8192)
+            plain_llm = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, streaming=True, num_ctx=2048, keep_alive=-1)
             raw_plain = [SystemMessage(content=system_prompt)] + State["messages"]
             plain_messages = []
             for m in raw_plain:
@@ -424,7 +424,7 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
         return
     from langchain_ollama import ChatOllama
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=8192)
+    client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=2048, keep_alive=-1)
     
     system_prompt = MEMORY_EVALUATION_PROMPT
 
@@ -539,7 +539,7 @@ async def summarize_short_term_memory_bg(session_id: str):
             
         from langchain_ollama import ChatOllama
         OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=8192)
+        client = ChatOllama(model="cow/gemma2_tools:2b", base_url=OLLAMA_BASE_URL, think=False, num_ctx=2048, keep_alive=-1)
         
         system_prompt = STM_SUMMARIZATION_PROMPT
         prompt = [
