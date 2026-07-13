@@ -49,6 +49,18 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 
 ---
 
+## Output Inference Optimization
+
+To achieve ultra-low latency and a smooth user experience, several inference optimizations are implemented:
+- **Time to First Token (TTFT) Tracking**: Focused on bringing TTFT down to <100ms for autocomplete and <500ms for chat UI. Streaming tokens locally via `llama.rn` are essential to maintain an uninterrupted conversational flow.
+- **KV Cache Optimization**: State caching handles multi-turn interactions, significantly reducing TTFT on subsequent requests (warm starts vs. cold starts) by keeping the context loaded in memory.
+- **On-Device Execution**: The mobile app runs `Gemma 2B` via `llama.rn` locally on the device's hardware. This entirely eliminates network overhead and prioritizes privacy-first zero-latency generation.
+- **Vision Prefilling for Realtime Video Chat**: Qwen Vision (a reasoning model) defaults to outputting `<think>` tags, delaying the actual response. We optimize this by forcibly prefilling the API response with `{"description": "`, bypassing the reasoning phase and slashing vision latency from >22s to <5s.
+- **Intelligent Scene Change Detection**: For live video chat, we avoid redundant LLM vision calls using multi-region MD5 hashing. The camera frame is divided into 3 regions (top, mid, bottom), and the vision model is only triggered if at least 2 out of 3 regions change, ignoring minor localized movements.
+- **Concurrent Processing**: Parallelizing tasks such as background STT/TTS fetching, LangGraph RAG retrievals, and memory updates out of the critical inference path ensures that model prefill and decode speeds remain the sole bottlenecks.
+
+---
+
 ## Features
 
 ### Core
@@ -309,16 +321,6 @@ ws://localhost:8000/api/audio_stream/ws
 | TTS first chunk | <500ms | 300-800ms |
 | Total (FAQ text) | <5s | 2-5s |
 | Total (live video) | <7s | 3-7s |
-
----
-
-## Output Inference Optimization
-
-To achieve ultra-low latency and a smooth user experience, several inference optimizations are implemented:
-- **Time to First Token (TTFT) Tracking**: Focused on bringing TTFT down to <100ms for autocomplete and <500ms for chat UI. Streaming tokens (e.g., via Groq or `llama.rn` locally) are essential to maintain an uninterrupted conversational flow.
-- **KV Cache Optimization**: State caching handles multi-turn interactions, significantly reducing TTFT on subsequent requests (warm starts vs. cold starts) by keeping the context loaded in memory.
-- **On-Device Execution**: The mobile app runs `Gemma 2B` via `llama.rn` locally on the device's hardware. This entirely eliminates network overhead and prioritizes privacy-first zero-latency generation.
-- **Concurrent Processing**: Parallelizing tasks such as background STT/TTS fetching, LangGraph RAG retrievals, and memory updates out of the critical inference path ensures that model prefill and decode speeds remain the sole bottlenecks.
 
 ---
 
