@@ -289,13 +289,24 @@ ws://localhost:8000/api/audio_stream/ws
 
 ---
 
-## Memory System
+## Context Management
 
-| Tier | Storage | Scope | Persistence |
-|---|---|---|---|
-| **Long-term** | Supabase `user_memory` table | Cross-session user facts | Permanent (until cleared) |
-| **Short-term** | SQLite `checkpoints.db` | Per-session conversation history | Until session TTL / manual delete |
-| **Session** | In-memory `ConnectionManager` | Live video chat state | 600s TTL, lost on restart |
+Context bloat is actively managed using dual-tiered memory to ensure ultra-low latency inference while maintaining deep contextual awareness.
+
+### Long-Term Memory (LTM)
+LTM persists user-specific facts (e.g., plan details, preferences) across sessions to provide a highly personalized experience.
+- **Storage**: Saved persistently in Supabase's `user_memory` table.
+- **Mechanism**: A background task (`evaluate_and_save_memory_bg`) runs after conversations to evaluate and extract newly learned facts.
+- **Retrieval**: Before every LLM generation, `fetch_user_memories` fetches the user's facts from Supabase and injects them directly into the system prompt.
+
+### Short-Term Memory (STM)
+STM handles the immediate conversational history for the current session.
+- **Storage**: Managed by LangGraph state and backed by SQLite (`checkpoints.db`).
+- **Mechanism**: To prevent context bloat when the conversation grows, a background task (`summarize_short_term_memory_bg`) automatically summarizes older messages. The old messages are pruned (using LangGraph's `RemoveMessage`), and the condensed summary is injected into the state, keeping the LLM prompt concise and fast.
+
+### Ephemeral Session State
+- **Storage**: Handled in-memory via `ConnectionManager`.
+- **Mechanism**: Manages transient state for live video/audio WebSocket connections, with a 600-second TTL.
 
 ---
 
