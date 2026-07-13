@@ -1,6 +1,6 @@
 # Jio FAQ Chatbot
 
-An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** (NVIDIA Llama 3.1 8B / Groq / Local LLMs). Features **speech-to-text**, **text-to-speech** (Sarvam AI), **live video/audio chat** with vision understanding, **PDF ingestion** (Qdrant), **image generation**, and **persistent user memory** (Supabase). Served via FastAPI with a React + Vite web frontend and a robust **React Native Expo mobile app** featuring **on-device Local LLM inference (Gemma 2B)** for ultra-low latency.
+An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** (Ollama Gemma-2-2B / Local LLMs). Features **speech-to-text**, **text-to-speech** (Sarvam AI), **live video/audio chat** with vision understanding, **PDF ingestion** (Qdrant), **image generation**, and **persistent user memory** (Supabase). Served via FastAPI with a React + Vite web frontend and a robust **React Native Expo mobile app** featuring **on-device Local LLM inference (Gemma 2B)** for ultra-low latency.
 
 ---
 
@@ -36,8 +36,8 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 │  │                                                      │    │
 │  │  retrieve_node: Neo4j vector + fulltext → Qdrant    │    │
 │  │                → CrossEncoder rerank → route        │    │
-│  │  generate_node: NVIDIA Llama 3.1 8B (FAQ)           │    │
-│  │  general_generation_node: NVIDIA Llama 3.1 8B + tools│   │
+│  │  generate_node: Gemma 2B (Ollama Local LLM)         │    │
+│  │  general_generation_node: Gemma 2B (Ollama) + tools │    │
 │  └──────────────────────────────────────────────────────┘    │
 └──────────┬──────────┬──────────┬──────────┬──────────────────┘
            │          │          │          │
@@ -53,16 +53,16 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 
 ### Core
 - **Hybrid RAG Pipeline** — Vector similarity (`all-MiniLM-L6-v2`) + Lucene fulltext search on Neo4j, reranked by CrossEncoder (`ms-marco-MiniLM-L-6-v2`)
-- **Multi-LLM Architecture** — NVIDIA Llama 3.1 8B for LangGraph RAG pipeline; Groq Llama 3.1 8B for low-latency live streaming; and **On-Device Local LLM (Gemma-2-2B)** in the mobile app for privacy-first, ultra-fast generation.
-- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (Qwen Vision / NVIDIA Llama 3.2 11B), and streaming TTS
-- **Live Audio Chat** — Streaming WebSocket with Sarvam STT → RAG retrieval → Groq streaming LLM → parallel Sarvam TTS
+- **Multi-LLM Architecture** — **Local Gemma-2-2B via Ollama** for LangGraph RAG pipeline and low-latency live streaming; and **On-Device Local LLM (Gemma-2-2B)** in the mobile app for privacy-first, ultra-fast generation.
+- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (**Qwen Vision**), and streaming TTS
+- **Live Audio Chat** — Streaming WebSocket with Sarvam STT → RAG retrieval → Local Gemma-2-2B streaming LLM → parallel Sarvam TTS
 - **Long-Term Memory** — Persisted user facts in Supabase `user_memory` table, injected into every LLM call
 - **Short-Term Memory** — LangGraph checkpointing via SQLite (`checkpoints.db`) for conversation history per session
 
 ### Multi-Modal
 - **Speech-to-Text** — Sarvam AI `saaras:v3` (Hinglish codemix, Silero VAD silence detection)
 - **Text-to-Speech** — Sarvam AI `bulbul:v3` streaming with sentence-boundary parallel fetching
-- **Vision (Upload)** — Analyze uploaded images via Qwen Vision / NVIDIA Llama 3.2 11B Vision
+- **Vision (Upload)** — Analyze uploaded images via Qwen Vision
 - **Image Generation** — Cloudflare Workers AI Flux (text-to-image)
 - **PDF Ingestion** — Upload PDFs → Docling conversion → chunking → Qdrant vector storage → per-user retrieval
 
@@ -81,9 +81,9 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 | **Language** | Python 3.10+ |
 | **Backend Framework** | FastAPI + Uvicorn |
 | **Agent Framework** | LangGraph, LangChain |
-| **FAQ LLM** | NVIDIA Llama 3.1 8B (`meta/llama-3.1-8b-instruct`) |
-| **Streaming LLM** | Groq Llama 3.1 8B (`llama-3.1-8b-instant`) |
-| **Vision LLM** | Qwen Vision / NVIDIA Llama 3.2 11B (`meta/llama-3.2-11b-vision-instruct`) |
+| **FAQ LLM** | Ollama Gemma 2 2B (`cow/gemma2_tools:2b`) |
+| **Streaming LLM** | Ollama Gemma 2 2B (`cow/gemma2_tools:2b`) |
+| **Vision LLM** | Qwen Vision (`qwen-vision`) |
 | **Local Mobile LLM** | Gemma 2 2B (`gemma-2-2b-it.gguf` via `llama.rn`) |
 | **Graph Database** | Neo4j (Docker, `bolt://localhost:7687`) |
 | **Vector Store (FAQ)** | Neo4j vector index (`faq_embeddings`) |
@@ -185,9 +185,8 @@ Create `.env` in the project root:
 
 ```env
 # LLM Providers
-NVDIA_API_KEY="nvapi-..."
-GROQ_API_KEY="gsk_..."
-CEREBRAS_API_KEY="csk_..."
+# Switched to Local Ollama! No cloud API keys needed for core LLM inference.
+OLLAMA_BASE_URL="http://localhost:11434"
 
 # Sarvam AI (STT/TTS)
 SARVAM_API_KEY="..."
