@@ -307,6 +307,12 @@ ws://localhost:8000/api/audio_stream/ws
 4. **Fulltext Index** — `create_index.py` builds Lucene index on FAQ `question` + `answer` fields
 5. **PDF Ingestion** — `POST /api/upload` → Docling → chunking (1000 chars, 200 overlap) → Qdrant
 
+### Neo4j Graph Database Schema
+The Neo4j graph represents the relationships between `Topic`, `Subtopic`, and `FAQ` nodes, enabling highly accurate contextual hybrid retrieval.
+
+![Neo4j Graph Database View 1](docs/images/graph_db_1.png)
+![Neo4j Graph Database View 2](docs/images/graph_db_2.png)
+
 ---
 
 ## Latency Goals
