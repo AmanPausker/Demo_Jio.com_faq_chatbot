@@ -1,6 +1,6 @@
 # Jio FAQ Chatbot
 
-An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** (NVIDIA Llama 3.1 8B / Groq). Features **speech-to-text**, **text-to-speech** (Sarvam AI), **live video/audio chat** with vision understanding, **PDF ingestion** (Qdrant), **image generation**, and **persistent user memory** (Supabase). Served via FastAPI with a React + Vite web frontend and a React Native Expo mobile app.
+An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines **Neo4j graph database** with **hybrid search (vector + fulltext)**, **CrossEncoder reranking**, and **LLM-powered generation** (NVIDIA Llama 3.1 8B / Groq / Local LLMs). Features **speech-to-text**, **text-to-speech** (Sarvam AI), **live video/audio chat** with vision understanding, **PDF ingestion** (Qdrant), **image generation**, and **persistent user memory** (Supabase). Served via FastAPI with a React + Vite web frontend and a robust **React Native Expo mobile app** featuring **on-device Local LLM inference (Gemma 2B)** for ultra-low latency.
 
 ---
 
@@ -53,8 +53,8 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 
 ### Core
 - **Hybrid RAG Pipeline** — Vector similarity (`all-MiniLM-L6-v2`) + Lucene fulltext search on Neo4j, reranked by CrossEncoder (`ms-marco-MiniLM-L-6-v2`)
-- **Dual LLM Architecture** — NVIDIA Llama 3.1 8B for LangGraph RAG pipeline; Groq Llama 3.1 8B for low-latency live streaming
-- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (NVIDIA Llama 3.2 11B), and streaming TTS
+- **Multi-LLM Architecture** — NVIDIA Llama 3.1 8B for LangGraph RAG pipeline; Groq Llama 3.1 8B for low-latency live streaming; and **On-Device Local LLM (Gemma-2-2B)** in the mobile app for privacy-first, ultra-fast generation.
+- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (Qwen Vision / NVIDIA Llama 3.2 11B), and streaming TTS
 - **Live Audio Chat** — Streaming WebSocket with Sarvam STT → RAG retrieval → Groq streaming LLM → parallel Sarvam TTS
 - **Long-Term Memory** — Persisted user facts in Supabase `user_memory` table, injected into every LLM call
 - **Short-Term Memory** — LangGraph checkpointing via SQLite (`checkpoints.db`) for conversation history per session
@@ -62,13 +62,13 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 ### Multi-Modal
 - **Speech-to-Text** — Sarvam AI `saaras:v3` (Hinglish codemix, Silero VAD silence detection)
 - **Text-to-Speech** — Sarvam AI `bulbul:v3` streaming with sentence-boundary parallel fetching
-- **Vision (Upload)** — Analyze uploaded images via NVIDIA Llama 3.2 11B Vision
+- **Vision (Upload)** — Analyze uploaded images via Qwen Vision / NVIDIA Llama 3.2 11B Vision
 - **Image Generation** — Cloudflare Workers AI Flux (text-to-image)
 - **PDF Ingestion** — Upload PDFs → Docling conversion → chunking → Qdrant vector storage → per-user retrieval
 
 ### UI
 - **Web Frontend** — React + Vite with text, audio, voice, and live video modes
-- **Mobile App** — React Native Expo with camera preview, VAD barge-in, and TTS queue
+- **Mobile App** — React Native Expo featuring **On-Device Local LLM inference via llama.rn**, camera preview, VAD barge-in, and TTS queue
 - **Gradio UI** — Standalone dev interface with audio recording and streaming playback
 - **A2UI Cards** — LLM can embed rich UI components (e.g., WeatherCard) in responses
 
@@ -83,7 +83,8 @@ An intelligent, multi-modal FAQ assistant for Jio.com support queries. Combines 
 | **Agent Framework** | LangGraph, LangChain |
 | **FAQ LLM** | NVIDIA Llama 3.1 8B (`meta/llama-3.1-8b-instruct`) |
 | **Streaming LLM** | Groq Llama 3.1 8B (`llama-3.1-8b-instant`) |
-| **Vision LLM** | NVIDIA Llama 3.2 11B (`meta/llama-3.2-11b-vision-instruct`) |
+| **Vision LLM** | Qwen Vision / NVIDIA Llama 3.2 11B (`meta/llama-3.2-11b-vision-instruct`) |
+| **Local Mobile LLM** | Gemma 2 2B (`gemma-2-2b-it.gguf` via `llama.rn`) |
 | **Graph Database** | Neo4j (Docker, `bolt://localhost:7687`) |
 | **Vector Store (FAQ)** | Neo4j vector index (`faq_embeddings`) |
 | **Vector Store (Docs)** | Qdrant Cloud (`jio_documents` collection) |
@@ -250,7 +251,7 @@ Navigate to `http://localhost:5173` (Vite dev server).
 ### Mobile App
 Scan the Expo QR code or run on a simulator.
 
-- **Text/voice chat** — `chat.tsx` with continuous VAD and push-to-talk
+- **Text/voice chat** — `chat.tsx` with continuous VAD, push-to-talk, and **Local LLM integration (Gemma 2B)**
 - **Live video chat** — `live.tsx` with camera preview, TTS queue, and barge-in
 
 ### API
