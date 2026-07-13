@@ -1015,19 +1015,45 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     import base64
     import asyncio
 
-    filler_phrases = [
-        'Let me wrap my head around this...', 'Connecting the dots...', 'Pulling this together...', 'Digging into this...',
-        'Mapping out the best approach...', 'Let me see what we have here...', 'Piecing it together...', 'Looking from a few angles...',
-        'Rummaging through the digital attic...', 'Bribing the server hamsters...', 'Dusting off the encyclopedias...', 'Asking the Magic 8-Ball...',
-        'Brewing some fresh data...', 'Waking up the algorithms...', 'Flipping through the infinite library...', 'Untangling the spaghetti code...',
-        'Spooling up the quantum drives...', 'Jacking into the mainframe...', 'Realigning the optical matrices...', 'Decrypting the archives...',
-        'Pinging the outer rim...', 'Calibrating the neural net...', 'Bypassing the firewall...', 'Synchronizing local nodes...',
-        'Consulting the archives...', 'Distilling the essentials...', 'Charting the approach...', 'Curating the best options...',
-        'Assembling the framework...', 'Reviewing the parameters...', 'Drafting the blueprint...', 'Aligning the variables...',
-        'Consulting the ancient scrolls...', 'Gazing into the orb...', 'Casting a revelation spell...', 'Listening to network whispers...',
-        'Summoning the answers...', 'Brewing the elixir of knowledge...', 'Translating the runes...', 'Putting the pieces into place...',
-        'Weighing the possibilities...', 'Finding the signal in the noise...', 'Separating fact from fiction...', 'Building the perfect response...'
-    ]
+    filler_phrases = [# Combined list for professional filler phrases
+
+    # Analytical & Precise
+    "Analyzing the parameters of your request...",
+    "Evaluating the requirements...",
+    "Synthesizing data to ensure accuracy...",
+    "Structuring the information for clarity...",
+    "Refining the response for precision...",
+    "Cross-referencing the technical details...",
+    "Formulating a strategic response...",
+    "Conducting a comprehensive review...",
+    "Verifying logical consistency...",
+    "Filtering for the most relevant insights...",
+    
+    # Efficiency & Process-Oriented
+    "Processing the request...",
+    "Compiling the necessary information...",
+    "Generating an optimized solution...",
+    "Retrieving relevant data points...",
+    "Organizing the requested content...",
+    "Executing the necessary procedures...",
+    "Validating the internal logic...",
+    "Preparing the final synthesis...",
+    "Synchronizing the data sets...",
+    "Optimizing the response architecture...",
+    
+    # Client-Focused & Supportive
+    "Drafting the response for your review...",
+    "Assembling the best possible approach for you...",
+    "Building a solution tailored to your specifications...",
+    "Summarizing the core findings...",
+    "Putting together the requested information...",
+    "Developing a clear path forward...",
+    "Identifying the most relevant insights...",
+    "Finalizing the details...",
+    "Preparing the documentation for your convenience...",
+    "Aligning the output with your objectives..."
+
+         ]
     chosen_phrase = random.choice(filler_phrases)
     # 1. Send the filler word to UI immediately- 
     await websocket.send_json({"type":"filler_word", "payload":chosen_phrase})
@@ -1077,7 +1103,36 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
     try:
         messages = []
 
-        if needs_vision and session.frame_buffer:
+        is_weather_query = any(kw in question.lower() for kw in ["weather", "temperature", "forecast", "rain", "hot", "cold", "climate", "location", "where am i", "current city"])
+
+        if is_weather_query:
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+            from workflow import workflow
+            initial_state = {
+                "question": question,
+                "messages": [("user", question)],
+                "context": "", "answer": "",
+                "user_id": session.user_id, "token": getattr(session, "token", "")
+            }
+            config = {"configurable": {"thread_id": session.session_id or session.user_id}}
+            try:
+                async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+                    langgraph_app = workflow.compile(checkpointer=memory)
+                    final_state = await langgraph_app.ainvoke(initial_state, config=config)
+                full_answer = final_state.get('answer', '')
+                new_answer, spoken_text, a2ui_msgs, surface_id = process_a2ui_messages(full_answer)
+                if a2ui_msgs:
+                    try:
+                        await websocket.send_json({"type": "a2ui_messages", "payload": a2ui_msgs})
+                    except Exception as ws_err:
+                        pass
+                skip_primary_llm = True
+                visual_desc = spoken_text
+            except Exception as e:
+                live_logger.error(f"[WEATHER LIVE ERROR] {e}")
+                is_weather_query = False
+
+        if not is_weather_query and needs_vision and session.frame_buffer:
             latest_frame = session.frame_buffer[-1]
 
             try:
@@ -1119,7 +1174,7 @@ async def handle_user_question(session: Session, question: str, websocket: WebSo
 
             skip_primary_llm = True
 
-        else:
+        elif not is_weather_query:
             skip_primary_llm = False
             from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
             

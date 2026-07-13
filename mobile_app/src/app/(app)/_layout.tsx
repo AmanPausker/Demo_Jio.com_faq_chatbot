@@ -76,15 +76,15 @@ function CustomDrawerContent(props: any) {
 
       <FlatList
         data={showAllSessions ? sessions : sessions.slice(0, 5)}
-        keyExtractor={(item, index) => item.session_id ? item.session_id.toString() : index.toString()}
+        keyExtractor={(item, index) => item.id ? item.id.toString() : index.toString()}
         contentContainerStyle={{ padding: 12 }}
         renderItem={({ item }) => (
           <TouchableOpacity 
-            style={[styles.sessionItem, activeSessionId === item.session_id && styles.activeSessionItem]}
-            onPress={() => handleSessionPress(item.session_id)}
+            style={[styles.sessionItem, activeSessionId === item.id && styles.activeSessionItem]}
+            onPress={() => handleSessionPress(item.id)}
           >
-            <Feather name="message-square" size={18} color={activeSessionId === item.session_id ? "#a855f7" : "#a1a1aa"} />
-            <Text style={[styles.sessionText, activeSessionId === item.session_id && styles.activeSessionText]} numberOfLines={1}>
+            <Feather name="message-square" size={18} color={activeSessionId === item.id ? "#a855f7" : "#a1a1aa"} />
+            <Text style={[styles.sessionText, activeSessionId === item.id && styles.activeSessionText]} numberOfLines={1}>
               {item.title || 'New Conversation'}
             </Text>
           </TouchableOpacity>

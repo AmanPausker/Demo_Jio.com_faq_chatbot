@@ -419,7 +419,7 @@ export default function ChatScreen() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://192.168.1.2:8000').replace('http', 'ws') + '/api/live/ws';
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://192.168.1.8:8000').replace('http', 'ws') + '/api/live/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -471,6 +471,20 @@ export default function ChatScreen() {
           setMessages(prev => [...prev, { role: 'bot', text: data.payload, id: Date.now().toString() }]);
           setIsPlaying(true);
           setTimeout(() => setIsPlaying(false), 4000);
+        } else if (data.type === 'a2ui_messages') {
+          let a2uiComponents = null;
+          for (const msg of data.payload) {
+            if (msg.updateComponents) {
+              for (const comp of msg.updateComponents.components) {
+                if (comp.component === 'WeatherCard') {
+                  a2uiComponents = comp.props;
+                }
+              }
+            }
+          }
+          if (a2uiComponents) {
+             setMessages(prev => [...prev, { role: 'bot', text: '', id: Date.now().toString() + '_a2ui', weather: a2uiComponents }]);
+          }
         } else if (data.type === 'transcript') {
           setMessages(prev => [...prev, { role: 'user', text: `🎤 ${data.payload}`, id: Date.now().toString() }]);
         } else if (data.type === 'user_speaking_start') {

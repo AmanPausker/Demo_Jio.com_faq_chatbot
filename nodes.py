@@ -446,6 +446,11 @@ async def evaluate_and_save_memory_bg(question: str, answer: str, user_id: str, 
             
         import re
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
+        # Robustly extract JSON object
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
             
         try:
             result = json.loads(content)
