@@ -313,6 +313,16 @@ ws://localhost:8000/api/audio_stream/ws
 
 ---
 
+## Output Inference Optimization
+
+To achieve ultra-low latency and a smooth user experience, several inference optimizations are implemented:
+- **Time to First Token (TTFT) Tracking**: Focused on bringing TTFT down to <100ms for autocomplete and <500ms for chat UI. Streaming tokens (e.g., via Groq or `llama.rn` locally) are essential to maintain an uninterrupted conversational flow.
+- **KV Cache Optimization**: State caching handles multi-turn interactions, significantly reducing TTFT on subsequent requests (warm starts vs. cold starts) by keeping the context loaded in memory.
+- **On-Device Execution**: The mobile app runs `Gemma 2B` via `llama.rn` locally on the device's hardware. This entirely eliminates network overhead and prioritizes privacy-first zero-latency generation.
+- **Concurrent Processing**: Parallelizing tasks such as background STT/TTS fetching, LangGraph RAG retrievals, and memory updates out of the critical inference path ensures that model prefill and decode speeds remain the sole bottlenecks.
+
+---
+
 ## License
 
 This project is for demonstration purposes. FAQ data belongs to Jio.com.
