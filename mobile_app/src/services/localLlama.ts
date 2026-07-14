@@ -8,22 +8,21 @@ export const getLlamaContext = async (): Promise<LlamaContext> => {
     if (llamaContext) return llamaContext;
     console.log("[LATENCY] Starting model initialization...");
 
-    // Assuming the GGUF model is downloaded to the app's document directory.
-    // In a real app, you'd add a download screen before reaching this point.
-    const modelPath = FileSystem.documentDirectory + 'gemma-2-2b-it.gguf';
+    const modelName = 'gemma-2-2b-it.gguf';
+    const modelPath = FileSystem.documentDirectory + modelName;
 
     try {
         const fileInfo = await FileSystem.getInfoAsync(modelPath);
         console.log(`Model file info: exists=${fileInfo.exists}, size=${fileInfo.exists ? fileInfo.size : 0} bytes`);
 
-        // The Gemma 2 2B model is roughly 1.6 GB 
-        // If it exists but is smaller than 1.5 GB, it was a partial download and needs to be redownloaded.
-        if (!fileInfo.exists || fileInfo.size < 1500000000) {
-            console.log(`Model not found locally. Downloading from ${API_URL}/public/gemma-2-2b-it.gguf...`);
-            console.log(`This is a 1.6GB file. It will take several minutes. Please wait...`);
+        // If it doesn't exist, it needs to be downloaded. 
+        // (You might want to add a size check here once you know the exact byte size of your new model)
+        if (!fileInfo.exists) {
+            console.log(`Model not found locally. Downloading from ${API_URL}/public/${modelName}...`);
+            console.log(`This is a large file. It will take several minutes. Please wait...`);
 
             const downloadResumable = FileSystem.createDownloadResumable(
-                `${API_URL}/public/gemma-2-2b-it.gguf`,
+                `${API_URL}/public/${modelName}`,
                 modelPath,
                 {},
                 (downloadProgress) => {
@@ -44,10 +43,12 @@ export const getLlamaContext = async (): Promise<LlamaContext> => {
         const osPath = modelPath.startsWith('file://') ? modelPath.replace('file://', '') : modelPath;
         llamaContext = await initLlama({
             model: osPath,
-            use_mlock: true,  
-            n_ctx: 1024,      
+            use_mlock: true,
+            use_mmap: true,
+            n_ctx: 512,
+            n_batch: 512,
             n_gpu_layers: 0,
-            n_threads: 8,     // Reverted to 8 as 4 was slower on Moto G85
+            n_threads: 7,
         });
 
         console.log(`[LATENCY] Model initialized successfully`);
@@ -55,6 +56,39 @@ export const getLlamaContext = async (): Promise<LlamaContext> => {
     } catch (error) {
         console.error("Failed to initialize LlamaContext", error);
         throw error;
+    }
+};
+
+export const importLocalModel = async (): Promise<boolean> => {
+    try {
+        const DocumentPicker = require('expo-document-picker');
+        const result = await DocumentPicker.getDocumentAsync({
+            type: '*/*',
+            copyToCacheDirectory: true,
+        });
+
+        if (result.canceled || !result.assets || result.assets.length === 0) {
+            return false;
+        }
+
+        const file = result.assets[0];
+        console.log("Selected file:", file.name);
+
+        const modelName = 'gemma-2-2b-it.gguf';
+        const targetPath = FileSystem.documentDirectory + modelName;
+
+        console.log("Copying to:", targetPath);
+        // Copy to document directory
+        await FileSystem.copyAsync({
+            from: file.uri,
+            to: targetPath
+        });
+
+        console.log("Model imported successfully to:", targetPath);
+        return true;
+    } catch (e) {
+        console.error("Failed to import model", e);
+        return false;
     }
 };
 
@@ -72,9 +106,9 @@ export const generateLocalResponse = async (
         context.completion(
             {
                 prompt,
-                n_predict: 256,   
+                n_predict: 256,
                 temperature: 0.7,
-                n_threads: 8,     
+                n_threads: 7,
             },
             (res) => {
                 // Stream the token to the UI
@@ -88,8 +122,15 @@ export const generateLocalResponse = async (
                 }
             }
         )
-            .then(() => {
+            .then((result) => {
                 console.log(`[LATENCY] Local LLM inference: ${Date.now() - tInf}ms chars=${fullResponse.length}`);
+                
+                if (result && result.timings) {
+                    const t = result.timings;
+                    console.log(`[BENCHMARK] Prompt: ${t.prompt_n} tokens in ${t.prompt_ms.toFixed(0)}ms`);
+                    console.log(`[BENCHMARK] Generation: ${t.predicted_n} tokens in ${t.predicted_ms.toFixed(0)}ms`);
+                    console.log(`[BENCHMARK] Speed: ${t.predicted_per_second.toFixed(2)} tokens/sec`);
+                }
 
                 // Basic Tool Interception Logic
                 // Check if the LLM outputted a JSON tool call instead of normal text

@@ -17,6 +17,7 @@ import {
   fetchSessions, loadSessionHistory, sendChatMessage,
   sendAudioMessage, uploadFile, generateImage
 } from '../../services/api';
+import { importLocalModel } from '../../services/localLlama';
 import Animated, { useSharedValue, useAnimatedStyle, withRepeat, withTiming, withSequence, Easing, cancelAnimation, interpolateColor } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
 
@@ -94,6 +95,14 @@ export default function ChatScreen() {
       console.log('Error fetching memories', e);
     } finally {
       setIsLoadingMemories(false);
+    }
+  };
+
+  const handleImportModel = async () => {
+    alert("Please select the downloaded gemma-4-e2b-it.gguf model file.");
+    const success = await importLocalModel();
+    if (success) {
+      alert("Model imported successfully! You can now use local inference.");
     }
   };
 
@@ -419,7 +428,7 @@ export default function ChatScreen() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://192.168.1.8:8000').replace('http', 'ws') + '/api/live/ws';
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://10.174.249.237:8000').replace('http', 'ws') + '/api/live/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -704,9 +713,14 @@ export default function ChatScreen() {
               <MaterialIcons name="auto-awesome" size={20} color="#a855f7" />
               <Text style={styles.headerTitle}>Assistant</Text>
             </View>
-            <TouchableOpacity onPress={openAccountModal}>
-              <Feather name="user" size={24} color="#fff" />
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 16 }}>
+              <TouchableOpacity onPress={handleImportModel}>
+                <Feather name="download" size={24} color="#fff" />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={openAccountModal}>
+                <Feather name="user" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 

@@ -3,7 +3,7 @@ import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateLocalResponse } from './localLlama';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://192.168.1.8:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.174.249.237:8000';
 import { MEMORY_EVALUATION_PROMPT, STM_SUMMARIZATION_PROMPT } from './prompts';
 
 const runBackgroundTasks = async (userMessage: string, aiMessage: string, sessionId: string, router: string, headers: any) => {
