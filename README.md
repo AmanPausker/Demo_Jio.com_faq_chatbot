@@ -61,25 +61,12 @@ To achieve ultra-low latency and a smooth user experience, several inference opt
 
 ## Features
 
-### Core
-- **Hybrid RAG Pipeline** — Vector similarity (`all-MiniLM-L6-v2`) + Lucene fulltext search on Neo4j, reranked by CrossEncoder (`ms-marco-MiniLM-L-6-v2`)
-- **Multi-LLM Architecture** — **Local Gemma-2-2B via Ollama** for LangGraph RAG pipeline and low-latency live streaming; and **On-Device Local LLM (Gemma-2-2B)** in the mobile app for privacy-first, ultra-fast generation.
-- **Live Video Chat** — Full-duplex WebSocket with camera frames (0.5 FPS), Silero VAD, vision LLM (**Qwen Vision**), and streaming TTS
-- **Live Audio Chat** — Streaming WebSocket with Sarvam STT → RAG retrieval → Local Gemma-2-2B streaming LLM → parallel Sarvam TTS
-- **Long-Term Memory** — Persisted user facts in Supabase `user_memory` table, injected into every LLM call
-- **Short-Term Memory** — LangGraph checkpointing via SQLite (`checkpoints.db`) for conversation history per session
-
-### Multi-Modal
-- **Speech-to-Text** — Sarvam AI `saaras:v3` (Hinglish codemix, Silero VAD silence detection)
-- **Text-to-Speech** — Sarvam AI `bulbul:v3` streaming with sentence-boundary parallel fetching
-- **Vision (Upload)** — Analyze uploaded images via Qwen Vision
-- **Image Generation** — Cloudflare Workers AI Flux (text-to-image)
-- **PDF Ingestion** — Upload PDFs → Docling conversion → chunking → Qdrant vector storage → per-user retrieval
-
-### UI
-- **Web Frontend** — React + Vite with text, audio, voice, and live video modes
-- **Mobile App** — React Native Expo featuring **On-Device Local LLM inference via llama.rn**, camera preview, VAD barge-in, and TTS queue
-- **A2UI Cards** — LLM can embed rich UI components (e.g., WeatherCard) in responses
+- **Hybrid RAG** — Vector similarity + Lucene fulltext search over a Neo4j knowledge graph, reranked with CrossEncoder. Semantic routing decides between direct answers, context-grounded generation, or free-form responses based on retrieval confidence.
+- **Multi-Modal I/O** — Text chat (SSE streaming), voice chat (STT/TTS), live video chat with real-time camera vision, PDF ingestion, image upload/analysis, and image generation.
+- **Dual-Tier Memory** — Long-term user facts persisted in Supabase and injected into every prompt. Short-term conversation history managed via LangGraph checkpointing with automatic summarization to prevent context bloat.
+- **On-Device LLM** — Mobile app runs Gemma 2B locally via LiteRT for sub-100ms text generation without network dependency.
+- **Acoustic Echo Cancellation** — Custom NLMS-based AudioWorklet pipeline prevents the AI from hearing its own TTS output during live/audio modes.
+- **Adaptive UI Cards** — LLM embeds structured rich components (e.g., WeatherCard) inline in chat responses via the A2UI protocol.
 
 ---
 
@@ -87,64 +74,57 @@ To achieve ultra-low latency and a smooth user experience, several inference opt
 
 | Layer | Technology |
 |---|---|
-| **Language** | Python 3.10+ |
-| **Backend Framework** | FastAPI + Uvicorn |
+| **Backend** | Python 3.10+, FastAPI, Uvicorn |
 | **Agent Framework** | LangGraph, LangChain |
-| **FAQ LLM** | Ollama Gemma 2 2B (`cow/gemma2_tools:2b`) |
-| **Streaming LLM** | Ollama Gemma 2 2B (`cow/gemma2_tools:2b`) |
-| **Vision LLM** | Qwen Vision (`qwen-vision`) |
-| **Local Mobile LLM** | Gemma 2 2B (`gemma-2-2b-it.gguf` via `llama.rn`) |
-| **Graph Database** | Neo4j (Docker, `bolt://localhost:7687`) |
-| **Vector Store (FAQ)** | Neo4j vector index (`faq_embeddings`) |
-| **Vector Store (Docs)** | Qdrant Cloud (`jio_documents` collection) |
-| **Embedding** | `all-MiniLM-L6-v2` (SentenceTransformers) |
-| **Reranking** | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| **STT** | Sarvam AI `saaras:v3` |
-| **TTS** | Sarvam AI `bulbul:v3` (speaker: `shubh`) |
-| **VAD** | Silero VAD |
-| **Auth + Memory** | Supabase (JWT, `user_memory`, `chat_sessions`) |
-| **Image Gen** | Cloudflare Workers AI (`@cf/black-forest-labs/flux-1-schnell`) |
-| **Checkpointing** | SQLite (`checkpoints.db`) via LangGraph `AsyncSqliteSaver` |
-| **Web Frontend** | React + Vite |
-| **Mobile** | React Native + Expo (SDK 54) |
+| **LLMs** | Gemma 2B via Ollama (RAG + streaming), Qwen Vision (image/video), Gemma 2B via LiteRT (on-device mobile) |
+| **Embeddings** | SentenceTransformers (`all-MiniLM-L6-v2`) |
+| **Reranking** | CrossEncoder (`ms-marco-MiniLM-L-6-v2`) |
+| **Knowledge Graph** | Neo4j (vector index + Lucene fulltext) |
+| **Document Store** | Qdrant (per-user PDF retrieval) |
+| **Auth & Memory** | Supabase (JWT auth, user memory, chat sessions) |
+| **Speech** | Sarvam AI (`saaras:v3` STT, `bulbul:v3` TTS), Silero VAD |
+| **Image Gen** | Cloudflare Workers AI (Flux) |
+| **Checkpointing** | SQLite via LangGraph `AsyncSqliteSaver` |
+| **Web Frontend** | React 19, Vite 8, Supabase JS, A2UI, ONNX Runtime Web (VAD) |
+| **Mobile App** | React Native 0.81, Expo SDK 54, LiteRT (Kotlin native module), WebRTC |
 
 ---
 
 ## Project Structure
 
 ```
-├── server.py              # FastAPI server (REST + WebSocket endpoints)
-├── app.py                 # LangGraph workflow definition
-├── nodes.py               # LangGraph nodes (retrieve, generate, general)
-├── agent_state.py         # GraphState TypedDict
-├── tools.py               # LangChain tools (weather, location)
-├── get_transcript.py      # Sarvam STT (WebSocket streaming + REST)
-├── get_audio.py           # Sarvam TTS (async streaming)
-├── file_workflow.py       # PDF ingestion (Docling → Qdrant)
-├── clear_memory.py        # Utility to clear Supabase user_memory
-├── checkpoints.db         # SQLite LangGraph checkpoints
-│
-├── frontend/              # Web app (React + Vite)
-│   └── src/
-│       ├── App.jsx        # Main chat UI (all modes)
-│       ├── Auth.jsx       # Supabase login/signup
-│       ├── A2UICatalog.tsx # Weather card component
-│       ├── supabaseClient.js
-│       └── fillersData.js # Pre-generated TTS fillers
-│
-├── mobile_app/            # Mobile app (React Native + Expo)
-│   └── src/
-│       ├── app/(app)/
-│       │   ├── chat.tsx   # Text + voice chat screen
-│       │   └── live.tsx   # Live video chat screen
-│       └── services/
-│           └── api.ts     # API client
+├── server.py                 # FastAPI server — REST + WebSocket endpoints
+├── app.py                    # LangGraph workflow definition
+├── nodes.py                  # Graph nodes — retrieval, generation, routing
+├── agent_state.py            # GraphState TypedDict
+├── system_instructions.py    # LLM system prompts
+├── tools.py                  # LangChain tools (weather, location)
+├── get_transcript.py         # Sarvam STT (WebSocket streaming + Silero VAD)
+├── get_audio.py              # Sarvam TTS (async streaming)
+├── file_workflow.py          # PDF ingestion — Docling → chunking → Qdrant
 │
 ├── data/
-│   ├── jio_faq_data.json  # Scraped FAQ dataset
-│   └── topics.json        # Topic hierarchy
+│   ├── jio_faq_data.json     # 200+ scraped FAQ entries
+│   └── topics.json           # Topic hierarchy
 │
-└── .env                   # API keys
+├── frontend/                 # React + Vite web app
+│   └── src/
+│       ├── App.jsx           # Chat UI (text, audio, voice, video modes)
+│       ├── Auth.jsx          # Supabase login/signup
+│       ├── A2UICatalog.tsx   # Adaptive UI card components
+│       └── utils/
+│           └── aecUtils.js   # Acoustic Echo Cancellation (AudioWorklet)
+│
+├── mobile_app/               # React Native Expo app
+│   └── src/
+│       ├── app/
+│       │   ├── (app)/chat.tsx   # Text + voice chat screen
+│       │   └── (app)/live.tsx   # Live video chat screen
+│       └── services/
+│           ├── api.ts           # Hybrid local + remote API client
+│           └── localLiteRT.ts   # On-device Gemma 2B via LiteRT
+│
+└── scripts/                  # Utility scripts (memory management, TTS fillers)
 ```
 
 ---
