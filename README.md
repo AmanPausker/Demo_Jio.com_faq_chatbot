@@ -165,6 +165,9 @@ The mobile app uses Google's LiteRT for native hardware acceleration.
 
 ### 3. Environment Variables (`.env`)
 
+This project requires **two** separate `.env` files: one for the backend server and one for the mobile app.
+
+#### A. Backend Server `.env`
 Create a `.env` file in the root directory (`/Users/amanpausker/jio_faq_chatbot/.env`). Here is the template with the necessary API keys you'll need to gather:
 
 ```env
@@ -192,6 +195,16 @@ WORKERS_API_KEY="your_cloudflare_workers_api_key"
 OPEN_WEATHER_API_KEY="your_openweather_api_key"
 ```
 *Note: The FastAPI backend will automatically use `OLLAMA_BASE_URL` to connect to both your local text LLM and the Qwen Vision model.*
+
+#### B. Mobile App `.env`
+Create a second `.env` file in the mobile application directory (`/Users/amanpausker/jio_faq_chatbot/mobile_app/.env`). This is needed for Expo to inject environment variables into the frontend.
+
+```env
+EXPO_PUBLIC_SUPABASE_URL="https://your-project-id.supabase.co"
+EXPO_PUBLIC_SUPABASE_ANON_KEY="your_supabase_anon_key_here"
+EXPO_PUBLIC_API_URL="http://192.168.1.5:8000"  # Replace with your machine's local IP where the backend runs
+EXPO_PUBLIC_LLAMA_GPU_LAYERS=0
+```
 
 ### 4. Step-by-Step Execution Guide
 
