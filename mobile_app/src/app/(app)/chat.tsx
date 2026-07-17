@@ -15,9 +15,9 @@ import { supabase } from '../../utils/supabaseClient';
 import { Feather, MaterialIcons } from '@expo/vector-icons';
 import {
   fetchSessions, loadSessionHistory, sendChatMessage,
-  sendAudioMessage, uploadFile, generateImage
+  sendAudioMessage, uploadFile, generateImage, resetLocalSessionState
 } from '../../services/api';
-import { importLocalModel } from '../../services/localLlama';
+import { importLocalModel, abortLocalGeneration } from '../../services/localLiteRT';
 import Animated, { useSharedValue, useAnimatedStyle, withRepeat, withTiming, withSequence, Easing, cancelAnimation, interpolateColor } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
 
@@ -43,11 +43,14 @@ const MessageItem = React.memo(({ item }: { item: any }) => {
   return (
     <View style={[styles.messageWrapper, item.role === 'user' ? styles.messageUser : styles.messageBot]}>
       <View style={[styles.messageBubble, item.role === 'user' ? styles.bubbleUser : styles.bubbleBot]}>
-        {(!item.weather && item.text.includes('"type"')) ? (
+        {(!item.weather && (item.text.includes('"type"') || item.text.includes('"name"') || item.text.includes('"tool"'))) ? (
           <Text style={[styles.messageText, { fontStyle: 'italic', color: '#a1a1aa' }]}>Generating widget...</Text>
         ) : (
           <Text style={styles.messageText}>
-            {item.text.includes('{"type":') ? item.text.split('{"type":')[0].trim() : item.text}
+            {item.text.includes('{"type":') ? item.text.split('{"type":')[0].trim() :
+              item.text.includes('{"name":') ? item.text.split('{"name":')[0].trim() :
+                item.text.includes('{"tool":') ? item.text.split('{"tool":')[0].trim() :
+                  item.text}
           </Text>
         )}
         {item.image && <Image source={{ uri: item.image }} style={styles.messageImage} contentFit="cover" />}
@@ -70,6 +73,7 @@ const MessageItem = React.memo(({ item }: { item: any }) => {
 });
 
 export default function ChatScreen() {
+  const flatListRef = useRef<FlatList>(null);
   const [loadingText, setLoadingText] = useState('Thinking...');
 
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
@@ -136,9 +140,11 @@ export default function ChatScreen() {
   const activeSessionIdRef = useRef<string | null>(null);
   const [isPlusMenuOpen, setIsPlusMenuOpen] = useState(false);
   const [isKeyboardVisible, setKeyboardVisible] = useState(false);
+  const [isLocalGenerating, setIsLocalGenerating] = useState(false);
   const params = useLocalSearchParams();
   const navigation = useNavigation();
   const router = useRouter();
+
   // Add this useEffect right below your other useEffects
   useEffect(() => {
     if (isLoading) {
@@ -248,6 +254,7 @@ export default function ChatScreen() {
   const [isRecordingVoiceMessage, setIsRecordingVoiceMessage] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [currentVolume, setCurrentVolume] = useState<number>(-100);
   const isPlayingRef = useRef(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
@@ -366,15 +373,21 @@ export default function ChatScreen() {
         setMessages(prev => [...prev, { id: botMessageId, role: 'bot', text: '' }]);
         // Keep isLoading true or false depending on how we want the UI. Actually, streaming text is already replacing the spinner.
         // We'll leave isLoading true so the user knows it's working, but the text will stream in real-time.
+        setIsLocalGenerating(true);
 
         const data: any = await sendChatMessage(userMsg.text, activeSessionId, (chunk) => {
+          setIsLoading(false);
           setMessages(prev => prev.map(m => {
             if (m.id === botMessageId) {
               return { ...m, text: m.text + chunk };
             }
             return m;
           }));
-        }, currentImage?.base64);
+        }, currentImage?.base64, messages);
+        setIsLocalGenerating(false); // Turning it off when the response is generated.
+        if (data && data.router) {
+          setMessages(prev => prev.map(m => (m.id === botMessageId || m.id === userMsg.id) ? { ...m, router: data.router } : m));
+        }
 
         if (activeSessionIdRef.current !== currentSessionId) return;
 
@@ -412,7 +425,7 @@ export default function ChatScreen() {
       const errorMsg = e.message ? `Error: ${e.message}` : 'Sorry, I encountered an error.';
       setMessages(prev => [...prev, { id: Date.now().toString(), role: 'bot', text: errorMsg }]);
     } finally {
-      setIsLoading(false);
+
     }
   };
 
@@ -428,7 +441,7 @@ export default function ChatScreen() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://10.174.249.237:8000').replace('http', 'ws') + '/api/live/ws';
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://100.0.249.210:8000').replace('http', 'ws') + '/api/live/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -492,7 +505,7 @@ export default function ChatScreen() {
             }
           }
           if (a2uiComponents) {
-             setMessages(prev => [...prev, { role: 'bot', text: '', id: Date.now().toString() + '_a2ui', weather: a2uiComponents }]);
+            setMessages(prev => [...prev, { role: 'bot', text: '', id: Date.now().toString() + '_a2ui', weather: a2uiComponents }]);
           }
         } else if (data.type === 'transcript') {
           setMessages(prev => [...prev, { role: 'user', text: `🎤 ${data.payload}`, id: Date.now().toString() }]);
@@ -736,11 +749,14 @@ export default function ChatScreen() {
             </View>
 
             <View style={styles.voiceCenter}>
-              <View style={styles.liveTextContainer}>
-                <Text style={styles.liveText} numberOfLines={8} adjustsFontSizeToFit>
+              <ScrollView 
+                style={{ width: '100%', flex: 1, marginBottom: 40, paddingHorizontal: 30 }}
+                contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', alignItems: 'center' }}
+              >
+                <Text style={styles.liveText}>
                   {messages[messages.length - 1]?.text?.replace('🎤 ', '') || "Ask anything..."}
                 </Text>
-              </View>
+              </ScrollView>
 
               <Text style={styles.voiceStatus}>
                 {fillerText ? fillerText : (isPlaying ? 'AI is speaking...' : isLoading ? 'Thinking...' : isRecording ? 'Listening...' : 'Speak freely...')}
@@ -769,6 +785,17 @@ export default function ChatScreen() {
         ) : (
           <>
             <FlatList
+              ref={flatListRef}
+              onContentSizeChange={() => {
+                if (messages.length > 0) {
+                  flatListRef.current?.scrollToEnd({ animated: true });
+                }
+              }}
+              onLayout={() => {
+                if (messages.length > 0) {
+                  flatListRef.current?.scrollToEnd({ animated: true });
+                }
+              }}
               data={messages}
               keyExtractor={item => item.id}
               renderItem={renderItem}
@@ -847,7 +874,19 @@ export default function ChatScreen() {
                       onSubmitEditing={handleSendText}
                     />
 
-                    {inputText.length === 0 && !selectedImage ? (
+                    {isLocalGenerating ? (
+                      <TouchableOpacity 
+                          style={[styles.iconBtn, { backgroundColor: '#ef4444', borderRadius: 24, width: 40, height: 40, justifyContent: 'center', alignItems: 'center' }]} 
+                          onPress={async () => {
+                              await abortLocalGeneration();
+                              resetLocalSessionState();
+                              setIsLocalGenerating(false);
+                              setMessages(prev => prev.slice(0, -2));
+                          }}
+                      >
+                        <Feather name="square" size={16} color="#fff" />
+                      </TouchableOpacity>
+                    ) : inputText.length === 0 && !selectedImage ? (
                       <>
                         <TouchableOpacity style={styles.iconBtn} onPress={startVoiceMessage}>
                           <Feather name="mic" size={22} color="#a1a1aa" />

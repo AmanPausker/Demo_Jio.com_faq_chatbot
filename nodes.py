@@ -26,6 +26,10 @@ URL = "bolt://localhost:7687"
 USERNAME = "neo4j"
 PASSWORD  = "password123"
 driver = GraphDatabase.driver(URL, auth=(USERNAME, PASSWORD))
+
+import logging
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+logging.getLogger("neo4j").setLevel(logging.ERROR)
 print("Loading Embedding Model")
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -285,7 +289,7 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     UNWIND (vector_nodes + text_nodes) AS f
     WITH DISTINCT f
     MATCH (t:Topic)-[:HAS_SUBTOPIC]->(s:Subtopic)-[:CONTAINS_FAQ]->(f)
-    RETURN "Topic: " + t.name + " | Subtopic: " + s.name + " | Question: " + f.question + " | Answer: " + f.answer AS context_string
+    RETURN "Topic: " + t.name + " | Subtopic: " + s.name + " | Question: " + f.question + " | Answer: " + f.answer AS rerank_text, f.answer AS llm_text
     """
     
     t_db = _time.time()
@@ -293,7 +297,10 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     with driver.session() as session:
         result = session.run(cypher_query, question_embedding=question_vector, keyword_query=keyword_query)
         for record in result:
-            candidates.append(record['context_string'])
+            candidates.append({
+                "rerank_text": record['rerank_text'],
+                "llm_text": record['llm_text']
+            })
     db_ms = (_time.time() - t_db) * 1000
     
     t_qdrant = _time.time()
@@ -303,7 +310,10 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     qdrant_ms = (_time.time() - t_qdrant) * 1000
     for chunk in qdrant_results:
         # We wrap it in a string so the LLM knows where it came from
-        candidates.append(f"Uploaded Document Context: {chunk}")
+        candidates.append({
+            "rerank_text": f"Uploaded Document Context: {chunk}",
+            "llm_text": f"Document Context: {chunk}"
+        })
         
     if not candidates:
         logger.info(f"[LATENCY] retrieve_node: db={db_ms:.0f}ms qdrant={qdrant_ms:.0f}ms candidates=0 total={(_time.time() - t_retrieve)*1000:.0f}ms")
@@ -312,16 +322,16 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
 
     # 4. Rerank candidates using CrossEncoder
     t_rerank = _time.time()
-    cross_inp = [[state["question"], context] for context in candidates]
+    cross_inp = [[state["question"], cand["rerank_text"]] for cand in candidates]
     scores = reranker.predict(cross_inp)
     rerank_ms = (_time.time() - t_rerank) * 1000
 
     # Combine candidates with scores, apply a massive boost to uploaded documents, and sort
     scored_candidates = []
-    for context, score in zip(candidates, scores):
-        if "Uploaded Document Context:" in context:
+    for cand, score in zip(candidates, scores):
+        if "Uploaded Document Context:" in cand["rerank_text"]:
             score += 5.0  # Massive priority boost for user's personal documents
-        scored_candidates.append((context, score))
+        scored_candidates.append((cand["llm_text"], score))
 
     scored_candidates = sorted(scored_candidates, key=lambda x: x[1], reverse=True)
     best_score = scored_candidates[0][1]
@@ -330,6 +340,7 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
     if best_score < -1.5:
         # Score too low — route to general agent, no logging (not a FAQ hit)
         print(f"Semantic Router: Best score {best_score:.4f} < -1.5. Routing to General Agent.")
+        logger.info(f"[RERANK] question='{state['question'][:80]}' best_score={best_score:.4f} < -1.5 (Routing to General Agent)")
         return {"context": "", "router": 1}
 
     # Score is good enough — log it to Loki
@@ -342,10 +353,14 @@ def retrieve_node(state:GraphState, config: RunnableConfig):
 
     top_candidates = [candidate for candidate, score in scored_candidates[:1]]
     
+    if best_score > 8.5:
+        # Directly paste the answer, bypassing the LLM
+        return {"context": "\n".join(top_candidates) + "\n", "router": 2, "direct_answer": True, "answer_text": scored_candidates[0][0]}
+    
     retrieved_context = "\n".join(top_candidates) + "\n"
     total_ms = (_time.time() - t_retrieve) * 1000
     logger.info(f"[LATENCY] retrieve_node: db={db_ms:.0f}ms qdrant={qdrant_ms:.0f}ms rerank={rerank_ms:.0f}ms candidates={len(candidates)} best_score={best_score:.2f} total={total_ms:.0f}ms")
-    return {"context": retrieved_context, "router": 2}
+    return {"context": retrieved_context, "router": 2, "direct_answer": False}
 
 def fetch_user_memories(user_id: str, token: str) -> str:
     if not user_id:

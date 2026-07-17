@@ -39,17 +39,6 @@ The `user_id` comes from Supabase JWT verification (`get_current_user`). This me
 - Conversational memory (accumulated `messages`) is **scoped per user**
 - Two users never see each other's conversation history
 
-### Gradio (`app.py:47-48`)
-
-The Gradio interface does **not** pass a `thread_id`:
-
-```python
-initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
-final_state = await app.ainvoke(initial_state)
-```
-
-Each invocation starts with an empty `messages` list, so **no conversation memory persists across turns** in the Gradio UI.
-
 ## Workflow Graph (`app.py:11-33`)
 
 ```
@@ -118,6 +107,5 @@ generate_node returns: {"messages": [AIMessage("...")]}
 | Boundary | Mechanism | Scope |
 |---|---|---|
 | Per-user | `thread_id = user_id` | Full conversation isolation |
-| Per-invocation (Gradio) | No `thread_id` set | Fresh state each turn |
 | Cross-node | `add_messages` reducer | Messages accumulate within a thread |
 | Cross-field | Last-write-wins for strings | Each node overwrites `answer`/`context` |

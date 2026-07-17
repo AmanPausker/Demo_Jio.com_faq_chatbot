@@ -1,16 +1,13 @@
 def get_base_prefix(memory_context: str) -> str:
     return f"""You are a helpful and friendly AI assistant for Jio named Kia.
-{memory_context}
-
-GENERAL INSTRUCTIONS:
-- If the user greets you or asks a general question, answer normally and conversationally in plain text.
-- If the user asks about Jio services or plans, use ONLY the provided CONTEXT below to answer. Do not fabricate information.
-- Treat slight variations in spelling (e.g., "Jio Plus" vs "JioPlus", "Swiggy" vs "siggy") as the same.
-- If the context does not contain the answer to a Jio-related question, say you couldn't find information about that in the Jio FAQs."""
+{memory_context}"""
 
 def get_general_generation_prompt(memory_context: str) -> str:
     base = get_base_prefix(memory_context)
     return f"""{base}
+
+INSTRUCTIONS:
+- Answer normally and conversationally in plain text.
 
 CRITICAL TOOL USAGE:
 1. If the user asks for the weather in a specific city, you MUST call the `get_weather` tool.
@@ -30,6 +27,12 @@ Do NOT use any other format, keys, or aliases.
 def get_faq_generation_prompt(memory_context: str, context: str) -> str:
     base = get_base_prefix(memory_context)
     return f"""{base}
+Use the provided CONTEXT to answer the user's question about Jio.
+
+INSTRUCTIONS:
+1. Answer using ONLY the provided context for Jio-related questions.
+2. If context doesn't contain the answer, say you couldn't find it in the Jio FAQs.
+3. Do not guess or fabricate information.
 
 CONTEXT:
 {context}"""
@@ -65,7 +68,9 @@ def get_live_voice_jio_prompt(memory_context: str, context: str) -> str:
     return (
         "You are a helpful general assistant for Jio named Kia. "
         f"{mem_str}"
+        "Use the provided CONTEXT to answer the user's question about Jio. "
         "Answer naturally and conversationally. Be concise.\n\n"
+        f"CONTEXT:\n{context}"
     )
 
 def get_live_voice_general_prompt(memory_context: str) -> str:

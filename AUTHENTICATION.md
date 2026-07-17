@@ -1,6 +1,6 @@
 # Authentication
 
-Authentication is implemented on the **FastAPI backend + React frontend** using **Supabase Auth** with **JWT Bearer tokens**. The Gradio UI (`app.py`) has no authentication.
+Authentication is implemented on the **FastAPI backend + React frontend** using **Supabase Auth** with **JWT Bearer tokens**.
 
 ## Architecture
 

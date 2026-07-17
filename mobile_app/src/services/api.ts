@@ -1,10 +1,17 @@
 import axios from 'axios';
 import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
-import { generateLocalResponse } from './localLlama';
+import { generateLocalResponse, resetLiteRTConversation } from './localLiteRT';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.174.249.237:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://100.0.249.210:8000';
 import { MEMORY_EVALUATION_PROMPT, STM_SUMMARIZATION_PROMPT } from './prompts';
+
+let lastSessionId: string | null = null;
+let isFirstMessageInSession = true;
+
+export const resetLocalSessionState = () => {
+  isFirstMessageInSession = true;
+};
 
 const runBackgroundTasks = async (userMessage: string, aiMessage: string, sessionId: string, router: string, headers: any) => {
   const tBgStart = Date.now();
@@ -22,7 +29,7 @@ const getHeaders = async () => {
   const tH = Date.now();
   const { data: { session } } = await supabase.auth.getSession();
   const elapsed = Date.now() - tH;
-  if (elapsed > 100) console.warn(`[LATENCY] getHeaders (Supabase getSession): ${elapsed}ms`);
+  if (elapsed > 100) console.warn(`\r\x1b[36m WARN  [LATENCY] getHeaders (Supabase getSession): ${elapsed}ms\x1b[0m`);
   return {
     'Content-Type': 'application/json',
     'Authorization': session ? `Bearer ${session.access_token}` : '',
@@ -51,7 +58,7 @@ export const loadSessionHistory = async (sessionId: string) => {
     const headers = await getHeaders();
     if (!headers['Authorization']) return [];
     const response = await axios.get(`${API_URL}/api/sessions/${sessionId}/history`, { headers });
-    console.log(`[LATENCY] Mobile loadSessionHistory: ${Date.now() - tLoad}ms`);
+    console.log(`\r\x1b[36m LOG  [LATENCY] Mobile loadSessionHistory: ${Date.now() - tLoad}ms\x1b[0m`);
     return response.data.history || [];
   } catch (error: any) {
     if (error.response?.status === 401) {
@@ -65,7 +72,7 @@ export const loadSessionHistory = async (sessionId: string) => {
 
 import EventSource from 'react-native-sse';
 
-export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void, imageBase64?: string) => {
+export const sendChatMessage = async (text: string, sessionId: string | null, onChunk?: (text: string) => void, imageBase64?: string, messages: any[] = []) => {
   const tTotal = Date.now();
   try {
     const headers = await getHeaders();
@@ -81,18 +88,65 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
         'Content-Type': 'application/json',
       }
     });
-    console.log(`[LATENCY] Mobile POST /api/chat/prepare: ${Date.now() - tPrep}ms`);
+    console.log(`\r\x1b[36m LOG  [LATENCY] Mobile POST /api/chat/prepare: ${Date.now() - tPrep}ms\x1b[0m`);
     
     // Step 2: Get the Prompt
-    const { prompt, context } = prepResponse.data;
+    const { prompt, context, router, direct_answer, answer_text } = prepResponse.data;
     
-    // Step 3: Run Local Inference
-    const tLocal = Date.now();
-    const gemmaPrompt = `<start_of_turn>user\n${prompt}\n\n${text}<end_of_turn>\n<start_of_turn>model\n`;
-    let finalAnswer = await generateLocalResponse(gemmaPrompt, (token) => {
-      if (onChunk) onChunk(token);
-    });
-    console.log(`[LATENCY] Mobile local LLM inference: ${Date.now() - tLocal}ms`);
+    // Reset LiteRT conversation if we switched to a different session
+    if (sessionId && lastSessionId && sessionId !== lastSessionId) {
+      await resetLiteRTConversation();
+      isFirstMessageInSession = true;
+    }
+    if (sessionId && sessionId !== lastSessionId) {
+      lastSessionId = sessionId;
+    }
+    
+    // Bypass LLM completely if cross-encoder score was extremely high
+    let finalAnswer = "";
+    if (direct_answer && answer_text) {
+        console.log(`\r\x1b[36m LOG  [LATENCY] High confidence hit! Bypassing LLM and returning direct answer.\x1b[0m`);
+        if (onChunk) onChunk(answer_text);
+        finalAnswer = answer_text;
+    } else {
+        // Step 3: Run Local Inference
+        const tLocal = Date.now();
+
+        // Inject filler words for Jio FAQ
+        if (router === 2 || router === "2") {
+            const fillers = [
+                "Let me check the Jio guidelines for you...\n\n",
+                "Looking that up in the Jio documentation...\n\n",
+                "Checking the Jio FAQ...\n\n",
+                "Let me pull up the Jio details for that...\n\n"
+            ];
+            const randomFiller = fillers[Math.floor(Math.random() * fillers.length)];
+            if (onChunk) onChunk(randomFiller);
+        }
+
+        let gemmaPrompt = "";
+        if (isFirstMessageInSession) {
+          if (context && context.length > 0) {
+            gemmaPrompt = `${prompt}\n\nIMPORTANT INSTRUCTION: You must answer the user's question using ONLY the CONTEXT below. Do not fabricate information.\n\nContext:\n${context}\n\nUser Question: ${text}`;
+          } else {
+            gemmaPrompt = `${prompt}\n\nUser Question: ${text}`;
+          }
+          isFirstMessageInSession = false;
+        } else {
+          if (context && context.length > 0) {
+            gemmaPrompt = `IMPORTANT INSTRUCTION: You must answer the user's question using ONLY the CONTEXT below. Do not fabricate information.\n\nContext:\n${context}\n\nUser Question: ${text}`;
+          } else {
+            gemmaPrompt = text;
+          }
+        }
+
+        console.log(`\r\x1b[36m LOG  [LATENCY] Total LLM Prompt Length: ${gemmaPrompt.length} chars\x1b[0m`);
+        
+        finalAnswer = await generateLocalResponse(gemmaPrompt, (token) => {
+          if (onChunk) onChunk(token);
+        });
+        console.log(`[LATENCY] Mobile local LLM inference: ${Date.now() - tLocal}ms`);
+    }
     
     let a2ui_messages: any[] = [];
     let surface_id = `chat_${Date.now()}`;
@@ -134,7 +188,7 @@ export const sendChatMessage = async (text: string, sessionId: string | null, on
           tool_name: tool_name,
           tool_args: tool_args
         }, { headers: { ...headers, 'Content-Type': 'application/json' } });
-        console.log(`[LATENCY] Mobile tool execution: ${Date.now() - tTool}ms`);
+        console.log(`\r\x1b[36m LOG  [LATENCY] Mobile tool execution: ${Date.now() - tTool}ms\x1b[0m`);
         
         const toolOutput = toolResponse.data.result;
         
@@ -239,7 +293,7 @@ export const sendAudioMessage = async (audioUri: string, sessionId: string | nul
     }
 
     const result = JSON.parse(uploadTask.body);
-    console.log(`[LATENCY] Mobile sendAudioMessage: ${Date.now() - tAudio}ms`);
+    console.log(`\r\x1b[36m LOG  [LATENCY] Mobile sendAudioMessage: ${Date.now() - tAudio}ms\x1b[0m`);
     return result;
   } catch (error) {
     console.error('Failed to send audio:', error);

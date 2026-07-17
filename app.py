@@ -1,9 +1,6 @@
-import gradio as gr
 from langgraph.graph import StateGraph, START, END
 from agent_state import GraphState
 from nodes import retrieve_node, generate_node, general_generation_node
-import time as _time
-from logger import logger
 
 workflow = StateGraph(GraphState)
 
@@ -26,88 +23,3 @@ workflow.add_conditional_edges("retrieve", route_request, {
 
 workflow.add_edge('generate', END)
 workflow.add_edge('general_generation', END)
-
-
-
-from get_transcript import listen_for_speech
-
-from get_audio import generate_speech
-
-async def process_text(user_message, history):
-    if not user_message:
-        yield "", history, None
-        return
-    
-    t_start = _time.time()
-    history.append({"role": "user", "content": user_message})
-    yield "", history, None
-    
-    initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
-    final_state = await app.ainvoke(initial_state)
-    llm_ms = (_time.time() - t_start) * 1000
-    answer = final_state['answer']
-    router_val = final_state.get("router", "?")
-    history.append({"role": "assistant", "content": answer})
-    logger.info(f"[LATENCY] Gradio process_text: llm={llm_ms:.0f}ms router={router_val} ans_len={len(answer)}")
-    
-    yield "", history, None
-    
-    # Generate TTS concurrently and return final tuple
-    t_tts = _time.time()
-    audio_tuple = await generate_speech(answer)
-    tts_ms = (_time.time() - t_tts) * 1000
-    logger.info(f"[LATENCY] Gradio TTS: {tts_ms:.0f}ms total={(_time.time() - t_start)*1000:.0f}ms")
-    yield "", history, audio_tuple
-
-async def process_audio(history):
-    # This triggers the server-side microphone
-    t_start = _time.time()
-    user_message = await listen_for_speech(silence_timeout=0.5)
-    stt_ms = (_time.time() - t_start) * 1000
-    
-    if not user_message.strip():
-        history.append({"role": "assistant", "content": "🎤 [Audio Mode] No speech detected. Please try speaking again."})
-        yield history, None
-        return
-        
-    history.append({"role": "user", "content": f"(User-Audio) {user_message}"})
-    yield history, None
-    logger.info(f"[LATENCY] Gradio STT: {stt_ms:.0f}ms")
-    
-    initial_state = {"question": user_message, "messages": [], "context": "", "answer": ""}
-    final_state = await app.ainvoke(initial_state)
-    llm_ms = (_time.time() - t_start) * 1000
-    answer = final_state['answer']
-    router_val = final_state.get("router", "?")
-    history.append({"role": "assistant", "content": answer})
-    logger.info(f"[LATENCY] Gradio process_audio: llm={llm_ms:.0f}ms router={router_val} ans_len={len(answer)}")
-    
-    yield history, None
-    
-    # Generate TTS concurrently and return final tuple
-    t_tts = _time.time()
-    audio_tuple = await generate_speech(answer)
-    tts_ms = (_time.time() - t_tts) * 1000
-    logger.info(f"[LATENCY] Gradio TTS: {tts_ms:.0f}ms total={(_time.time() - t_start)*1000:.0f}ms")
-    yield history, audio_tuple
-
-with gr.Blocks(title="JIO FAQ BOT") as demo:
-    gr.Markdown("# JIO FAQ BOT\nAsk me anything about Jio Plans, 5G, or services")
-    
-    chatbot = gr.Chatbot()
-    audio_out = gr.Audio(visible=True, autoplay=True, label="Bot Voice Response")
-    
-    with gr.Row():
-        with gr.Column(scale=8):
-            msg = gr.Textbox(show_label=False, placeholder="Type your question here...")
-        with gr.Column(scale=1):
-            text_btn = gr.Button("Send")
-        with gr.Column(scale=1):
-            audio_btn = gr.Button("🎤")
-
-    msg.submit(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot, audio_out])
-    text_btn.click(process_text, inputs=[msg, chatbot], outputs=[msg, chatbot, audio_out])
-    audio_btn.click(process_audio, inputs=[chatbot], outputs=[chatbot, audio_out])
-
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)

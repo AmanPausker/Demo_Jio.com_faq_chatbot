@@ -361,12 +361,17 @@ async def prepare_chat(request: ChatRequest, user_id: str = Depends(get_current_
         system_prompt = get_faq_generation_prompt(memory_context, context)
     
     total_ms = (time.time() - t_prepare) * 1000
-    logger.info(f"[LATENCY] /api/chat/prepare: rag={rag_ms:.0f}ms mem={mem_ms:.0f}ms router={router} total={total_ms:.0f}ms (NOTE: LLM inference NOT included - runs client-side)")
+    logger.info(f"[LATENCY] /api/chat/prepare: rag={rag_ms:.0f}ms mem={mem_ms:.0f}ms router={router} context_chars={len(context)} total={total_ms:.0f}ms (NOTE: LLM inference NOT included - runs client-side)")
     
-    return {"prompt": system_prompt, "router": router, "context": context}
+    direct_answer = router_response.get("direct_answer", False)
+    answer_text = router_response.get("answer_text", "")
+    return {"prompt": system_prompt, "router": router, "context": context, "direct_answer": direct_answer, "answer_text": answer_text}
 
 @server.post("/api/chat/save_history")
 async def save_chat_history(request: ChatSaveRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user), token: str = Depends(get_token)):
+    if str(request.router).strip() != "2":
+        from nodes import evaluate_and_save_memory_bg
+        background_tasks.add_task(evaluate_and_save_memory_bg, request.user_message, request.ai_message, user_id, token)
     config = {"configurable": {"thread_id": request.session_id}}
     
     # 0. Auto-create session if it doesn't exist
@@ -1367,14 +1372,8 @@ async def finalize_transcript(session: Session, websocket: WebSocket):
         t_stt_start = time.time()
 
         # ── Finalise the streaming STT session → get final transcript ──
-        if session.stt_session is not None:
-            transcript = await session.stt_session.finalize()
-            await session.stt_session.__aexit__(None, None, None)
-            session.stt_session = None
-        else:
-            # Fallback: REST transcription if streaming session was never opened
-            transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
-
+        transcript = await transcribe_pcm(audio_data, SAMPLE_RATE)
+        
         t_stt_end = time.time()
         logger.debug(f"[LATENCY] STT took {(t_stt_end - t_stt_start)*1000:.0f}ms")
 
@@ -1382,23 +1381,9 @@ async def finalize_transcript(session: Session, websocket: WebSocket):
             transcript = re.sub(r'(?i)\bjio\s*phones?\s*plus\b', 'Jio Plus', transcript)
             await websocket.send_json({"type": "transcript", "payload": transcript})
             asyncio.create_task(handle_user_question(session, transcript, websocket))
-        else:
-            # Nothing recognised — close current STT session cleanly if still open
-            if session.stt_session is not None:
-                try:
-                    await session.stt_session.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                session.stt_session = None
 
     except Exception as e:
         logger.debug(f"STT Error in live chunk: {e}")
-        if session.stt_session is not None:
-            try:
-                await session.stt_session.__aexit__(None, None, None)
-            except Exception:
-                pass
-            session.stt_session = None
 
 async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket: WebSocket):
     pcm_bytes = base64.b64decode(audio_chunk_b64)
@@ -1407,9 +1392,9 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
     if session.vad_iterator is None:
         session.vad_iterator = VADIterator(
             _vad_model,
-            threshold=0.8,
+            threshold=0.95,
             sampling_rate=SAMPLE_RATE,
-            min_silence_duration_ms=600,
+            min_silence_duration_ms=800,
         )
 
     samples = (np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0).tolist()
@@ -1419,27 +1404,6 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
 
     session.vad_sample_buffer.extend(samples)
 
-    # ── Open a streaming STT session on the first audio chunk of a new utterance ──
-    if session.stt_session is None:
-        try:
-            stt = StreamingSTTSession()
-            await stt.__aenter__()
-            session.stt_session = stt
-        except Exception as e:
-            logger.debug(f"[StreamingSTT] Failed to open session: {e}")
-
-    # Feed PCM to Sarvam streaming STT
-    if session.stt_session is not None:
-        await session.stt_session.send_pcm(pcm_bytes)
-
-        # Flush any pending partial transcripts and forward to the client
-        partial = await session.stt_session.drain_partials()
-        if partial:
-            try:
-                await websocket.send_json({"type": "partial_transcript", "payload": partial})
-            except Exception:
-                pass
-
     speech_ended = False
     while len(session.vad_sample_buffer) >= VAD_WINDOW:
         window = torch.tensor(session.vad_sample_buffer[:VAD_WINDOW], dtype=torch.float32)
@@ -1448,6 +1412,11 @@ async def process_audio_chunk(session: Session, audio_chunk_b64: str, websocket:
         if result:
             if "start" in result:
                 logger.info(f"[VAD] Speech started")
+                
+                # Abort any ongoing LLM/TTS processing immediately
+                session.current_response_id = None
+                session.is_processing = False
+                
                 asyncio.create_task(analyze_scene_background(session))
                 if getattr(session, "tts_track", None):
                     session.tts_track.clear_queue()

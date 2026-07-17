@@ -1,7 +1,17 @@
 .env
+.DS_Store
 
 # Large model files
 *.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.litertlm
+models/
+
+# APK files
+*.apk
 
 # Database / checkpoints
 *.db
@@ -13,6 +23,9 @@
 # Node modules
 node_modules/
 mobile_app/node_modules/
+
+# LiteLLM
+.litellm/
 
 # Python cache
 __pycache__/
