@@ -441,7 +441,7 @@ export default function ChatScreen() {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) return;
 
-      const wsUrl = (process.env.EXPO_PUBLIC_API_URL || 'http://100.0.249.210:8000').replace('http', 'ws') + '/api/live/ws';
+      const wsUrl = (process.env.EXPO_PUBLIC_API_URL as string).replace('http', 'ws') + '/api/live/ws';
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 

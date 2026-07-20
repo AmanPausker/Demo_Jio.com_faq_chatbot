@@ -3,7 +3,7 @@ import { supabase } from '../utils/supabaseClient';
 import * as FileSystem from 'expo-file-system/legacy';
 import { generateLocalResponse, resetLiteRTConversation } from './localLiteRT';
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://100.0.249.210:8000';
+const API_URL = process.env.EXPO_PUBLIC_API_URL as string;
 import { MEMORY_EVALUATION_PROMPT, STM_SUMMARIZATION_PROMPT } from './prompts';
 
 let lastSessionId: string | null = null;
